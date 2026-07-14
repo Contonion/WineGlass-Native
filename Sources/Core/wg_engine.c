@@ -635,6 +635,25 @@ static void wg_srw_release_exclusive(uint32_t p, uint32_t tid) {
     pthread_cond_broadcast(&s_srw_cond);
     pthread_mutex_unlock(&s_srw_lock);
 }
+// Deadlock-breaker (WG_DEADLOCK_KICKSRW): at a hard stall the FName-pool SRW shards can
+// be stuck with a LEAKED reader/writer (e.g. a thread longjmp'd out of a locked region
+// on Abort-recovery, skipping the release), so an exclusive acquirer (the main) waits
+// on readers>0 forever. When the watchdog sees a genuine all-idle deadlock, force-clear
+// held SRW locks and broadcast so the blocked acquirer proceeds. Returns #locks reset.
+static int wg_srw_kick(void) {
+    static signed char on = -1;
+    if (on < 0) on = getenv("WG_DEADLOCK_KICKSRW") ? 1 : 0;
+    if (!on) return 0;
+    pthread_mutex_lock(&s_srw_lock);
+    int n = 0;
+    for (int i = 0; i < s_srw_count; i++)
+        if (s_srw[i].readers > 0 || s_srw[i].writer_tid != 0) {
+            s_srw[i].readers = 0; s_srw[i].writer_tid = 0; s_srw[i].writer_rec = 0; n++;
+        }
+    pthread_cond_broadcast(&s_srw_cond);
+    pthread_mutex_unlock(&s_srw_lock);
+    return n;
+}
 static int wg_srw_try_shared(uint32_t p, uint32_t tid) {
     pthread_mutex_lock(&s_srw_lock);
     WGSrw *s = wg_srw_for(p);
@@ -9294,7 +9313,8 @@ static void *wg_deadlock_watchdog(void *arg) {
                 }
                 if (do_kick) {
                     int k = wg_sync_kick_workers();
-                    fprintf(stderr, "[watchdog] kicked %d parked worker events\n", k);
+                    int ks = wg_srw_kick();
+                    fprintf(stderr, "[watchdog] kicked %d parked worker events, reset %d stuck SRW locks\n", k, ks);
                     low = secs > 6 ? secs - 6 : 0;   // re-check in ~6s; kick again if still stalled
                 }
             }
