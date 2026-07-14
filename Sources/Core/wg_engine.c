@@ -1922,7 +1922,7 @@ static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t
 // is cheap and gives the UE4 level load room despite exact-size reuse's address
 // fragmentation. Run with WG_LINEAR_GB >= 40 so gsize covers this. Physical RAM
 // (host ~24GB) is the real limit, not this window.
-#define WG_HEAP64_END  0x1800000000ULL
+#define WG_HEAP64_END  0x2800000000ULL
 static uint64_t s_heap64_ptr = WG_HEAP64_BASE;
 // Region-3 free list + size tracking so VirtualFree of a large pool RECLAIMS it. Without
 // this, the game's buffer-grow churn (alloc bigger, memcpy, free old) leaks region 3 too
