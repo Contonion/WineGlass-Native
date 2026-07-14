@@ -3296,15 +3296,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (nxt == cur && cur != 0 && cur == s_loop_last) s_loop_same++;
             else { s_loop_same = 0; s_loop_last = cur; }
             if (s_loop_same > BREAK_AFTER) {                       // genuinely stuck self-loop
-                // Patch the node in guest memory so EVERY walk site (this one, the hash
-                // iterator, ...) sees a terminated chain — not just this register.
+                // Diagnose the walk's EXIT test (0xA5AC30: cmp [rbx+0x20], rsi; jne exit).
+                // On real HW this loop terminates, so either [node+0x20] or rsi is wrong
+                // under emulation. Dump both + the node header so we can find the real bug
+                // instead of patching (which can drop objects -> missing CDOs).
+                uint64_t f20 = 0, f10 = 0, f00 = 0;
+                wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x20), &f20, 8);
+                wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x10), &f10, 8);
+                wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x00), &f00, 8);
+                uint64_t rsi = wg_blink_get_reg(engine->blink, 6);
                 uint64_t zero = 0;
                 wg_blink_write_mem(engine->blink, (uint32_t)(cur + of), &zero, 8);
                 nxt = 0;
                 s_loop_same = 0;
                 if ((++s_loop_breaks % 1000ULL) == 1)
-                    WG_LOGW(TAG, "WG_LOOPBREAK: patched stuck self-loop node 0x%llX @site 0x%llX (%llu total)",
-                            (unsigned long long)cur, (unsigned long long)rip, s_loop_breaks);
+                    WG_LOGW(TAG, "WG_LOOPBREAK: self-loop node=0x%llX @0x%llX | [+0x20]=0x%llX rsi=0x%llX (eq=%d) [+0x10 class]=0x%llX [+0 vtbl]=0x%llX",
+                            (unsigned long long)cur, (unsigned long long)rip,
+                            (unsigned long long)f20, (unsigned long long)rsi, (f20==rsi),
+                            (unsigned long long)f10, (unsigned long long)f00);
             }
             wg_blink_set_reg(engine->blink, rg, nxt);            // reg = next (or 0 to break)
             wg_blink_set_rip(engine->blink, (uint32_t)(rip + 4)); // past the 4-byte mov
