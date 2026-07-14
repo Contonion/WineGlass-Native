@@ -228,20 +228,24 @@ static bool mov_open(NSString *path, id<MTLDevice> dev) {
 }
 
 // Called from the engine (any thread) when the guest reaches Content/Movies.
-// `dir` is the host path to the movies folder. We queue the game's startup logos.
+// Startup sequence: Unreal Engine logo, the SadSquare studio logo, then Visage's
+// atmospheric startup video. (In-game videos like the TV mask are NOT boot movies.)
+static char s_mov_dir[1024];
+static void mov_fill_queue(void) {
+    const char *seq[] = {"UnrealEngineFullscreenLogo.mp4", "FullScreenLogo.mp4",
+                         "startup-video.mp4", NULL};
+    s_mov_queue = [[NSMutableArray alloc] init];
+    for (int i = 0; seq[i]; i++) {
+        NSString *p = [NSString stringWithFormat:@"%s/%s", s_mov_dir, seq[i]];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) [s_mov_queue addObject:p];
+    }
+}
+// `dir` is the host path to the movies folder. Queue the game's startup movies.
 void wg_gpu_play_movie(const char *dir) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&s_mov_state, &expected, 1)) return;
-    // Visage's REAL startup logo sequence ONLY: Unreal Engine logo then the
-    // SadSquare studio logo. (pms/cr_sign/eye/rr_*/etc. are IN-GAME videos — the
-    // creepy mask plays on a TV later in the game, not at boot.) After the logos
-    // the game itself should reach its menu (once the UObject drain completes).
-    const char *seq[] = {"UnrealEngineFullscreenLogo.mp4", "FullScreenLogo.mp4", NULL};
-    s_mov_queue = [[NSMutableArray alloc] init];
-    for (int i = 0; seq[i]; i++) {
-        NSString *p = [NSString stringWithFormat:@"%s/%s", dir, seq[i]];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) [s_mov_queue addObject:p];
-    }
+    strncpy(s_mov_dir, dir, sizeof(s_mov_dir) - 1); s_mov_dir[sizeof(s_mov_dir)-1] = 0;
+    mov_fill_queue();
     if (!s_mov_queue.count) { atomic_store(&s_mov_state, 2); return; }
     // Defer the actual open to the render thread (needs the Metal device); mark
     // playing and let mov_present pull the first file.
@@ -267,7 +271,13 @@ static bool mov_present(id<CAMetalDrawable> d, id<MTLCommandBuffer> cb) {
                 s_mov_reader = nil; s_mov_out = nil;
                 if (s_mov_tex) { s_mov_tex = nil; }
                 if (s_mov_cvtex) { CFRelease(s_mov_cvtex); s_mov_cvtex = NULL; }
-                if (!s_mov_queue.count) atomic_store(&s_mov_state, 2);
+                if (!s_mov_queue.count) {
+                    // WG_MOVIE_LOOP: replay the startup sequence so the window keeps
+                    // showing the game's frames (the guest boot hasn't reached its own
+                    // menu yet). Otherwise stop after one pass.
+                    if (getenv("WG_MOVIE_LOOP")) { mov_fill_queue(); s_mov_wall0 = 0; s_mov_pts = 0; }
+                    else atomic_store(&s_mov_state, 2);
+                }
                 return atomic_load(&s_mov_state) == 1;
             }
             CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);

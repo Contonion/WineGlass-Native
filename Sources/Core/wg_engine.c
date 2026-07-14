@@ -9591,6 +9591,16 @@ bool wg_engine_run(WGEngine *engine) {
     if (getenv("WG_DEADLOCK_DUMP")) {
         pthread_t wt; if (pthread_create(&wt, NULL, wg_deadlock_watchdog, NULL) == 0) pthread_detach(wt);
     }
+    // WG_MOVIE_DIR: play the game's startup movies natively on the window RIGHT NOW,
+    // at engine start — independent of the guest. UE4's boot loads a required Engine
+    // asset (anim curve compression settings) and fatals before it reaches its own
+    // movie-player enumeration, so the guest-triggered WG_NATIVE_MOVIE path never
+    // fires. Playing the logo movie directly puts the game's actual startup frames on
+    // screen while the guest boot is worked on. Point WG_MOVIE_DIR at Content/Movies.
+    if (getenv("WG_MOVIE_DIR")) {
+        WG_LOGW(TAG, "WG_MOVIE_DIR: playing startup movies natively from '%s'", getenv("WG_MOVIE_DIR"));
+        wg_gpu_play_movie(getenv("WG_MOVIE_DIR"));
+    }
     engine->state = WG_ENGINE_RUNNING;
     WG_LOGI(TAG, "Execution started (backend: %s)",
             engine->backend == WG_BACKEND_BLINK ? "blink" : "builtin");
