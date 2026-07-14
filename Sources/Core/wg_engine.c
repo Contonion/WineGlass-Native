@@ -3150,13 +3150,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // node, hand back 0 so the guest's own null-check terminates the walk. Emulate the
     // 4-byte mov and jump +4, keeping the HLT so it re-traps under the JIT.
     if (s_loop_armed && rip == s_loop_addr) {
+        // CAUTION: a node whose next==self is only a BUG if the walk is genuinely stuck
+        // there forever. During construction a node is *transiently* self-referential
+        // (its terminator not yet linked) — nulling that would corrupt the half-built
+        // list and crash the hash insert (0xb72582). So only break after the SAME self-
+        // node has been re-walked many CONSECUTIVE times (a real infinite loop); a
+        // transient self-ref advances (next!=cur, or cur changes) and resets the count.
+        static uint64_t s_loop_last = 0; static unsigned long long s_loop_same = 0;
         static unsigned long long s_loop_breaks = 0;
+        const unsigned long long BREAK_AFTER = 200000ULL;
         uint64_t cur = wg_blink_get_reg(engine->blink, 3);     // rbx = current node
         uint64_t nxt = 0; wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x28), &nxt, 8);
-        if (nxt == cur && cur != 0) {                          // self-referential node -> break
+        if (nxt == cur && cur != 0 && cur == s_loop_last) s_loop_same++;
+        else { s_loop_same = 0; s_loop_last = cur; }
+        if (s_loop_same > BREAK_AFTER) {                       // genuinely stuck self-loop
             nxt = 0;
-            if ((++s_loop_breaks % 100000ULL) == 1)
-                WG_LOGW(TAG, "WG_LOOPBREAK: terminated self-loop at node 0x%llX (%llu total)",
+            s_loop_same = 0;
+            if ((++s_loop_breaks % 1000ULL) == 1)
+                WG_LOGW(TAG, "WG_LOOPBREAK: terminated stuck self-loop at node 0x%llX (%llu total)",
                         (unsigned long long)cur, s_loop_breaks);
         }
         wg_blink_set_reg(engine->blink, 3, nxt);              // rbx = next (or 0 to break)
@@ -8964,7 +8975,7 @@ static bool load_pe_blink(WGEngine *engine) {
     s_loop_armed = false;
     if (pe->is_64bit && getenv("WG_LOOPPROBE")) {
         const char *a = getenv("WG_LOOP_ADDR");
-        s_loop_addr = a ? strtoull(a, 0, 16) : 0xB72547ULL;
+        s_loop_addr = a ? strtoull(a, 0, 16) : 0xA5AC68ULL;   // UObject list-walk advance
         if (wg_blink_read_mem(engine->blink, s_loop_addr, &s_loop_orig, 1)) {
             uint8_t hlt = 0xF4;
             wg_blink_write_mem(engine->blink, s_loop_addr, &hlt, 1);
