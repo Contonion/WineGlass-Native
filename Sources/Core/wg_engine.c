@@ -3504,16 +3504,22 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // return address + 32-byte shadow space. Truncating to 32 bits is safe:
     // 64-bit images are rebased below 4GB and stack/heap/thunks all sit there.
     uint32_t args[16] = {0};
+    // Full 64-bit args (parallel to the 32-bit `args`). Handlers that take guest
+    // POINTERS must use args64 so they work with the 64-bit VirtualAlloc heap
+    // (>4GB) — reading the pointer as 32-bit `args[i]` truncates it to garbage.
+    uint64_t args64[16] = {0};
     if (is_32bit) {
         wg_blink_read_mem(engine->blink, rsp + 4, args, sizeof(args));
+        for (int i = 0; i < 16; i++) args64[i] = args[i];
     } else {
-        args[0] = (uint32_t)wg_blink_get_reg(engine->blink, 1);  // RCX
-        args[1] = (uint32_t)wg_blink_get_reg(engine->blink, 2);  // RDX
-        args[2] = (uint32_t)wg_blink_get_reg(engine->blink, 8);  // R8
-        args[3] = (uint32_t)wg_blink_get_reg(engine->blink, 9);  // R9
+        args64[0] = wg_blink_get_reg(engine->blink, 1);  // RCX
+        args64[1] = wg_blink_get_reg(engine->blink, 2);  // RDX
+        args64[2] = wg_blink_get_reg(engine->blink, 8);  // R8
+        args64[3] = wg_blink_get_reg(engine->blink, 9);  // R9
         uint64_t stack_args[12] = {0};
         wg_blink_read_mem(engine->blink, rsp + 8 + 32, stack_args, sizeof(stack_args));
-        for (int i = 0; i < 12; i++) args[4 + i] = (uint32_t)stack_args[i];
+        for (int i = 0; i < 12; i++) args64[4 + i] = stack_args[i];
+        for (int i = 0; i < 16; i++) args[i] = (uint32_t)args64[i];
     }
 
     // Default return value: the registered stub's intent (R1S->1, etc.). The
@@ -4309,7 +4315,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 uint16_t arch = 9; memcpy(si + 0, &arch, 2);   // PROCESSOR_ARCHITECTURE_AMD64
                 v32 = 4096;        memcpy(si + 4,  &v32, 4);   // dwPageSize
                 v64 = 0x00010000;  memcpy(si + 8,  &v64, 8);   // lpMinimumApplicationAddress
-                v64 = 0xF0000000ULL; memcpy(si + 16, &v64, 8);  // lpMaximumApplicationAddress (~3.75GB — covers the expanded 32-bit heap region 2 at 0xA0000000..0xF0000000 so FMallocBinned2 accepts those pool pointers; stays in uint32_t so no handler truncation)
+                v64 = 0x800000000ULL; memcpy(si + 16, &v64, 8);  // lpMaximumApplicationAddress (32GB — must cover the 64-bit VirtualAlloc heap at 0x200000000.. so FMallocBinned2 accepts those large-pool pointers; reserves there are address-space-only (cheap) and committed on demand, so a big pool reservation no longer exhausts the guest)
                 v64 = wg_cpumask(); memcpy(si + 24, &v64, 8);  // dwActiveProcessorMask
                 v32 = wg_ncpu();   memcpy(si + 32, &v32, 4);   // dwNumberOfProcessors
                 v32 = 8664;        memcpy(si + 36, &v32, 4);   // dwProcessorType
@@ -5583,20 +5589,41 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // 64-bit guest: args[] is truncated to 32-bit, so read the FULL 64-bit
             // RCX(addr)/RDX(size) — the game's FMallocBinned2 pools live in the
             // 64-bit heap (>4GB) once the 1GB 32-bit heap is used up.
-            uint32_t va_addr = args[0], va_size = args[1];
+            uint64_t va_addr = args64[0], va_size = args64[1];
+            uint32_t va_type = args[2];              // MEM_COMMIT=0x1000, MEM_RESERVE=0x2000
             if (va_size == 0) {
                 ret_val = 0;                     // Windows: size 0 -> ERROR_INVALID_PARAMETER
                 s_last_error = 87;
             } else if (va_addr != 0) {
-                ret_val = va_addr;               // commit into an already-mapped reservation
+                // Commit into an existing reservation. For the 64-bit heap the reserve
+                // handed back address space only, so back this sub-range with real pages
+                // now (if committing). 32-bit heap regions are already backed.
+                if (va_addr >= 0x200000000ull && (va_type & 0x1000))
+                    wg_guest_map64(engine, va_addr, va_size);
+                ret_val = va_addr;
+            } else if (engine->pe_image && engine->pe_image->is_64bit &&
+                       va_size >= 64ull * 1024 * 1024) {
+                // LARGE pool -> the huge 64-bit heap (0x200000000+, grows to 24GB). The
+                // 32-bit heap is only ~2.75GB and WineGlass's bump allocator never frees,
+                // so a full UE4 asset load's alloc/free churn exhausts it -> FMalloc OOM
+                // -> fatal exit right before the UI renders. Big pools go 64-bit (their
+                // pointers flow through args64-aware mem handlers); small allocs stay in
+                // the 32-bit heap so the many 32-bit-only handlers keep working. Reserve
+                // is cheap (address space only); only COMMIT backs pages, so a giant
+                // MEM_RESERVE costs nothing until the game commits sub-ranges.
+                uint64_t a = wg_guest_reserve64(va_size, 0x10000);
+                if (a && (va_type & 0x1000)) {   // MEM_COMMIT -> back it now
+                    if (!wg_guest_map64(engine, a, va_size)) a = 0;
+                }
+                ret_val = a;
             } else {
-                // Fresh reservation: align to the OS allocation granularity (64KB).
-                // FMallocBinned2 depends on this alignment for its pool math. The
-                // 32-bit heap now spans two regions (~2.5GB) — see wg_guest_alloc.
-                ret_val = wg_guest_alloc_aligned(engine, va_size, 0x10000);
+                // Fresh small reservation: align to the OS allocation granularity (64KB).
+                // FMallocBinned2 depends on this alignment for its pool math.
+                ret_val = wg_guest_alloc_aligned(engine, (uint32_t)va_size, 0x10000);
             }
-            WG_LOGI(TAG, "VirtualAlloc(addr=0x%X, size=%u, type=0x%X) -> 0x%llX",
-                    args[0], va_size, args[2], (unsigned long long)ret_val);
+            WG_LOGI(TAG, "VirtualAlloc(addr=0x%llX, size=%llu, type=0x%X) -> 0x%llX",
+                    (unsigned long long)va_addr, (unsigned long long)va_size, va_type,
+                    (unsigned long long)ret_val);
         } else if (strcmp(fn, "??2@YAPAXI@Z") == 0 ||   // operator new(uint)
                    strcmp(fn, "malloc") == 0) {
             // CRT allocators used by real DLLs (StdUtils, etc.). Returning 0
@@ -5622,8 +5649,9 @@ static bool handle_blink_thunk(WGEngine *engine) {
                    strcmp(fn, "free") == 0) {
             ret_val = 0;   // bump allocator: free is a no-op
         } else if (strcmp(fn, "memset") == 0) {
-            // memset(dest=args[0], c=args[1], n=args[2]) -> returns dest (cdecl)
-            uint32_t dst = args[0], n = args[2];
+            // memset(dest, c, n) -> returns dest (cdecl). Use args64 for the pointer so
+            // it works with 64-bit-heap buffers (>4GB); the blink helpers take u64.
+            uint64_t dst = args64[0], n = args64[2];
             if (dst && n && n <= 64u * 1024 * 1024) {
                 // Fast direct in-guest fill (no malloc/bounce) — ~2x the memcpy/memset
                 // grind rate. Now DEFAULT ON: the old deadlock it exposed is fixed by
@@ -5631,24 +5659,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // the malloc bounce on an unmapped page. WG_NO_FASTMEM disables.
                 static signed char s_fastmem = -1;
                 if (s_fastmem < 0) s_fastmem = getenv("WG_NO_FASTMEM") ? 0 : 1;
-                if (!s_fastmem || !wg_blink_mem_set(engine->blink, dst, (int)args[1], n)) {
-                    uint8_t *tmp = malloc(n);
-                    if (tmp) { memset(tmp, (int)args[1], n);
-                        wg_blink_write_mem(engine->blink, dst, tmp, n); free(tmp); }
+                if (!s_fastmem || !wg_blink_mem_set(engine->blink, dst, (int)args64[1], n)) {
+                    uint8_t *tmp = malloc((size_t)n);
+                    if (tmp) { memset(tmp, (int)args64[1], (size_t)n);
+                        wg_blink_write_mem(engine->blink, dst, tmp, (uint32_t)n); free(tmp); }
                 }
             }
             ret_val = dst;
         } else if (strcmp(fn, "memcpy") == 0 || strcmp(fn, "memmove") == 0) {
-            // mem(c)py(dest=args[0], src=args[1], n=args[2]) -> returns dest
-            uint32_t dst = args[0], src = args[1], n = args[2];
+            // mem(c)py(dest, src, n) -> returns dest. Use args64 for the pointers.
+            uint64_t dst = args64[0], src = args64[1], n = args64[2];
             if (dst && src && n && n <= 64u * 1024 * 1024) {
                 // Fast direct guest->guest copy (no malloc) — default ON (see memset).
                 static signed char s_fastmem = -1;
                 if (s_fastmem < 0) s_fastmem = getenv("WG_NO_FASTMEM") ? 0 : 1;
                 if (!s_fastmem || !wg_blink_mem_copy(engine->blink, dst, src, n)) {
-                    uint8_t *tmp = malloc(n);
-                    if (tmp) { wg_blink_read_mem(engine->blink, src, tmp, n);
-                        wg_blink_write_mem(engine->blink, dst, tmp, n); free(tmp); }
+                    uint8_t *tmp = malloc((size_t)n);
+                    if (tmp) { wg_blink_read_mem(engine->blink, src, tmp, (uint32_t)n);
+                        wg_blink_write_mem(engine->blink, dst, tmp, (uint32_t)n); free(tmp); }
                 }
             }
             ret_val = dst;
