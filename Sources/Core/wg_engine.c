@@ -1917,7 +1917,7 @@ static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t
 // linear region). Large VirtualAlloc pools live here so they don't exhaust the sub-4GB
 // 32-bit heap. Capped at 8GB (the linear region end) — a reserve past it fails cleanly.
 #define WG_HEAP64_BASE 0x100000000ULL
-#define WG_HEAP64_END  0x3FFF00000ULL
+#define WG_HEAP64_END  0x4FFF00000ULL
 static uint64_t s_heap64_ptr = WG_HEAP64_BASE;
 // Region-3 free list + size tracking so VirtualFree of a large pool RECLAIMS it. Without
 // this, the game's buffer-grow churn (alloc bigger, memcpy, free old) leaks region 3 too
