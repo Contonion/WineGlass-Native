@@ -224,6 +224,17 @@ static struct { uint64_t addr; uint8_t reg; uint8_t off; uint8_t orig; bool arme
 static bool     s_loop_armed = false;
 static uint8_t  s_loop_orig  = 0;
 static uint64_t s_loop_addr  = 0xA5AC68;
+// WG_ANIMFIX: the boot fatals ("Couldn't find default curve compression settings under
+// '[Animation.DefaultObjectSettings]'") because that Engine default lives in the pak's
+// BaseEngine.ini, which our config layer doesn't deliver to GConfig — so the config
+// value getter returns an empty path and LoadObject fails. Hook the exact getter call
+// (0x18822A3: `call 0x2f8190` with rdx = output FString) and populate the FString with
+// the correct object path, skipping the getter, so LoadObject finds the (present) asset.
+static bool     s_anim_armed = false;
+static uint8_t  s_anim_orig  = 0;
+static uint64_t s_anim_addr  = 0x18822A3;   // the value getter (call 0x2f8190)
+static uint8_t  s_anim_orig2 = 0;
+static uint64_t s_anim_addr2 = 0x1882274;   // the section lookup (call 0x58d410) — force non-null
 // Set once the boot is PAST early UObject registration (the corruption window) — the
 // game shows its main window only after engine PreInit/registration. From then on the
 // WG_BLOCK_WORKERS gate stops parking pool workers so the post-init task-graph
@@ -3320,6 +3331,52 @@ static bool handle_blink_thunk(WGEngine *engine) {
             (void)s_loop_orig;
             return true;
         }
+    }
+
+    // WG_ANIMFIX: supply the default anim curve compression settings path the config
+    // getter (0x18822A3: call 0x2f8190) would otherwise return empty. rdx = out FString
+    // {Data(8), ArrayNum(4), ArrayMax(4)}. Write the wide path into a fresh guest buffer,
+    // point the FString at it, return "found" (rax=1), and skip the getter call.
+    // Build a minimal real config entry (once) whose value string is the correct path,
+    // so the natural flow: section -> entry[0] -> value.Data (rbx) -> LoadObject(r8=path)
+    // loads the (pak-present) asset instead of fatal'ing. Layout the guest code expects:
+    //   section S: [S+0] = entries array base
+    //   entry  E (48B): value struct at E+8, i.e. value.Data at E+0x18, value.Len at E+0x20
+    static uint32_t s_anim_section = 0;
+    if (s_anim_armed && (rip == s_anim_addr || rip == s_anim_addr2) && !s_anim_section) {
+        static const char kPath[] = "/Engine/Animation/DefaultAnimCurveCompressionSettings";
+        int len = (int)strlen(kPath);
+        uint32_t P = wg_guest_alloc(engine, (uint32_t)((len + 1) * 2));
+        uint32_t E = wg_guest_alloc(engine, 64);
+        uint32_t S = wg_guest_alloc(engine, 16);
+        if (P && E && S) {
+            uint16_t w[80]; for (int i = 0; i <= len; i++) w[i] = (uint16_t)(uint8_t)kPath[i];
+            wg_blink_write_mem(engine->blink, P, w, (uint32_t)((len + 1) * 2));
+            uint8_t z[64] = {0}; wg_blink_write_mem(engine->blink, E, z, 64);
+            uint64_t pd = P; int32_t plen = len + 1;
+            wg_blink_write_mem(engine->blink, E + 0x18, &pd, 8);    // value.Data = path
+            wg_blink_write_mem(engine->blink, E + 0x20, &plen, 4);  // value.Len
+            uint64_t eb = E; wg_blink_write_mem(engine->blink, S, &eb, 8);  // [S+0] = entries
+            s_anim_section = S;
+            WG_LOGW(TAG, "WG_ANIMFIX: built config entry S=0x%X E=0x%X path=0x%X", S, E, P);
+        }
+    }
+    // Section lookup: return our fake section so the value path is taken.
+    if (s_anim_armed && rip == s_anim_addr2) {
+        wg_blink_set_reg(engine->blink, 0, s_anim_section);     // rax = section
+        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 5));
+        (void)s_anim_orig2;
+        return true;
+    }
+    // Value getter: return index 0 (our single entry). rdx = &out index ([rsp+0x40]).
+    if (s_anim_armed && rip == s_anim_addr) {
+        uint64_t rdx = wg_blink_get_reg(engine->blink, 2);
+        int32_t idx = 0;
+        if (rdx) wg_blink_write_mem(engine->blink, (uint32_t)rdx, &idx, 4);
+        wg_blink_set_reg(engine->blink, 0, 0);
+        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 5));
+        (void)s_anim_orig;
+        return true;
     }
 
     // Real-threads: handle the FUNCTIONAL cipher-list max_ver trap here (not just
@@ -9179,6 +9236,26 @@ static bool load_pe_blink(WGEngine *engine) {
                 WG_LOGW(TAG, "WG_LOOPPROBE: armed self-loop breaker @0x%llX (orig=0x%02X)",
                         (unsigned long long)s_loops[li].addr, s_loops[li].orig);
             }
+        }
+    }
+
+    // WG_ANIMFIX (default ON for 64-bit): arm the anim curve-compression config-getter
+    // hook so the boot doesn't fatal on the missing Engine default. Disable with
+    // WG_NO_ANIMFIX.
+    s_anim_armed = false;
+    if (pe->is_64bit && !getenv("WG_NO_ANIMFIX")) {
+        uint8_t hlt = 0xF4;
+        bool ok1 = wg_blink_read_mem(engine->blink, s_anim_addr, &s_anim_orig, 1) && s_anim_orig == 0xE8;
+        bool ok2 = wg_blink_read_mem(engine->blink, s_anim_addr2, &s_anim_orig2, 1) && s_anim_orig2 == 0xE8;
+        if (ok1 && ok2) {
+            wg_blink_write_mem(engine->blink, s_anim_addr,  &hlt, 1);
+            wg_blink_write_mem(engine->blink, s_anim_addr2, &hlt, 1);
+            s_anim_armed = true;
+            WG_LOGW(TAG, "WG_ANIMFIX: armed curve-compression config hooks @0x%llX (section) + 0x%llX (value)",
+                    (unsigned long long)s_anim_addr2, (unsigned long long)s_anim_addr);
+        } else {
+            WG_LOGW(TAG, "WG_ANIMFIX: NOT armed (orig bytes: value=0x%02X section=0x%02X, expected 0xE8)",
+                    s_anim_orig, s_anim_orig2);
         }
     }
 

@@ -150,6 +150,8 @@ typedef struct {
     uint32_t handle;
     bool     in_use;
     char     path[512];
+    uint8_t *inj;        // in-memory override content (config injection); NULL = use fp
+    long     inj_len, inj_pos;
 } WGFileEntry;
 
 static WGFileEntry s_files[WG_MAX_FILE_HANDLES] = {0};
@@ -333,7 +335,36 @@ uint32_t wg_files_create(const char *real_path, uint32_t access, uint32_t creati
             s_files[i].fp = fp;
             s_files[i].handle = s_next_handle++;
             s_files[i].in_use = true;
+            s_files[i].inj = NULL; s_files[i].inj_len = 0; s_files[i].inj_pos = 0;
             strncpy(s_files[i].path, real_path, sizeof(s_files[i].path) - 1);
+            // CONFIG INJECTION (root fix for the anim-curve-compression fatal): UE4 reads
+            // its Engine defaults ([Animation.DefaultObjectSettings]) from the pak's
+            // BaseEngine.ini, which our pak layer doesn't deliver to the game's config
+            // system — so GConfig has no default curve/bone compression settings path and
+            // the boot fatals before the menu. Serve Engine.ini reads with those defaults
+            // appended so they land in GConfig's Engine branch (the game reads this file
+            // as the user config layer of GEngineIni).
+            if (strcasestr(real_path, "Config") &&
+                strcasestr(real_path, "Engine.ini") &&
+                !strcasestr(real_path, "GameUserSettings")) {
+                static const char *INJ =
+                    "\n[Animation.DefaultObjectSettings]\n"
+                    "BoneCompressionSettings=\"/Engine/Animation/DefaultAnimBoneCompressionSettings\"\n"
+                    "CurveCompressionSettings=\"/Engine/Animation/DefaultAnimCurveCompressionSettings\"\n";
+                long ilen = (long)strlen(INJ);
+                fseek(fp, 0, SEEK_END); long flen = ftell(fp); fseek(fp, 0, SEEK_SET);
+                if (flen < 0) flen = 0;
+                uint8_t *buf = (uint8_t *)malloc((size_t)flen + (size_t)ilen);
+                if (buf) {
+                    size_t got = fread(buf, 1, (size_t)flen, fp);
+                    memcpy(buf + got, INJ, (size_t)ilen);
+                    s_files[i].inj = buf;
+                    s_files[i].inj_len = (long)got + ilen;
+                    s_files[i].inj_pos = 0;
+                    WG_LOGI(TAG, "config-inject: %s (+anim defaults, %ld bytes)", real_path, s_files[i].inj_len);
+                }
+                fseek(fp, 0, SEEK_SET);
+            }
             // Remember the wizard/welcome bitmap as it's extracted, so the
             // nsDialogs welcome page can draw it natively (the script normally
             // loads it via System::Call, which we don't emulate).
@@ -359,6 +390,14 @@ static WGFileEntry *find_file(uint32_t handle) {
 bool wg_files_read(uint32_t handle, void *buf, uint32_t bytes, uint32_t *bytes_read) {
     WGFileEntry *f = find_file(handle);
     if (!f) return false;
+    if (f->inj) {                              // serve from the injected buffer
+        long avail = f->inj_len - f->inj_pos; if (avail < 0) avail = 0;
+        long n = (long)bytes < avail ? (long)bytes : avail;
+        if (n > 0) memcpy(buf, f->inj + f->inj_pos, (size_t)n);
+        f->inj_pos += n;
+        if (bytes_read) *bytes_read = (uint32_t)n;
+        return true;
+    }
     if (!f->fp) {
         memset(buf, 0, bytes);
         if (bytes_read) *bytes_read = bytes;
@@ -384,6 +423,7 @@ bool wg_files_write(uint32_t handle, const void *buf, uint32_t bytes, uint32_t *
 uint32_t wg_files_get_size(uint32_t handle) {
     WGFileEntry *f = find_file(handle);
     if (!f) return 0xFFFFFFFF;
+    if (f->inj) return (uint32_t)f->inj_len;
     if (!f->fp) return 0;
     long pos = ftell(f->fp);
     fseek(f->fp, 0, SEEK_END);
@@ -395,6 +435,12 @@ uint32_t wg_files_get_size(uint32_t handle) {
 uint32_t wg_files_set_pointer(uint32_t handle, int32_t distance, uint32_t method) {
     WGFileEntry *f = find_file(handle);
     if (!f) return 0xFFFFFFFF;
+    if (f->inj) {
+        long base = (method == 1) ? f->inj_pos : (method == 2) ? f->inj_len : 0;
+        f->inj_pos = base + distance; if (f->inj_pos < 0) f->inj_pos = 0;
+        if (f->inj_pos > f->inj_len) f->inj_pos = f->inj_len;
+        return (uint32_t)f->inj_pos;
+    }
     int whence;
     switch (method) {
         case 0: whence = SEEK_SET; break;
@@ -410,6 +456,12 @@ uint32_t wg_files_set_pointer(uint32_t handle, int32_t distance, uint32_t method
 // .pak files (offsets that don't fit in the 32-bit variant above).
 uint64_t wg_files_set_pointer_64(uint32_t handle, int64_t offset, uint32_t method) {
     WGFileEntry *f = find_file(handle);
+    if (f && f->inj) {
+        long base = (method == 1) ? f->inj_pos : (method == 2) ? f->inj_len : 0;
+        f->inj_pos = base + (long)offset; if (f->inj_pos < 0) f->inj_pos = 0;
+        if (f->inj_pos > f->inj_len) f->inj_pos = f->inj_len;
+        return (uint64_t)f->inj_pos;
+    }
     if (!f || !f->fp) return 0;
     int whence = (method == 1) ? SEEK_CUR : (method == 2) ? SEEK_END : SEEK_SET;
     fseeko(f->fp, (off_t)offset, whence);
@@ -520,7 +572,8 @@ static void wg_cache_wizard_bmp(const char *src) {
 bool wg_files_close(uint32_t handle) {
     WGFileEntry *f = find_file(handle);
     if (!f) return false;
-    fclose(f->fp);
+    if (f->inj) { free(f->inj); f->inj = NULL; f->inj_len = f->inj_pos = 0; }
+    if (f->fp) fclose(f->fp);
     if (strcasestr(f->path, "wizard") && strcasestr(f->path, ".bmp"))
         wg_cache_wizard_bmp(f->path);
     f->in_use = false;
