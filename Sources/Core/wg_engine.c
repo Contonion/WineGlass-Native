@@ -3940,17 +3940,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
         // needle the game keeps searching for in the asset-scan loop, once per unique
         // needle string, to identify what it's looking for and never finding.
         if (!strcmp(fn, "wcsstr")) {
-            static uint64_t s_seen_needle[64]; static int s_seen_n = 0;
-            uint64_t ndl = args64[1]; int seen = 0;
-            for (int i = 0; i < s_seen_n; i++) if (s_seen_needle[i] == ndl) { seen = 1; break; }
-            if (!seen && s_seen_n < 64) {
-                s_seen_needle[s_seen_n++] = ndl;
-                uint16_t w[256]; wg_read_wstr(engine, ndl, w, 256);
-                char nb[256]; int i = 0; for (; i < 255 && w[i]; i++) nb[i] = (char)(w[i] < 128 ? w[i] : '?'); nb[i] = 0;
-                uint16_t hw[64]; wg_read_wstr(engine, args64[0], hw, 64);
-                char hb[64]; int k = 0; for (; k < 63 && hw[k]; k++) hb[k] = (char)(hw[k] < 128 ? hw[k] : '?'); hb[k] = 0;
-                WG_LOGW(TAG, "wcsstr needle[%d]=\"%s\"  haystack@0x%llX starts \"%s\"",
-                        s_seen_n, nb, (unsigned long long)args64[0], hb);
+            // Track needle usage counts; log the HOT needle (the O(N^2) drain lookup)
+            // once, with its string + haystack, to identify what it rescans forever.
+            static uint64_t s_nd[128]; static uint32_t s_ndc[128]; static uint8_t s_ndl_logged[128]; static int s_ndn = 0;
+            uint64_t ndl = args64[1]; int idx = -1;
+            for (int i = 0; i < s_ndn; i++) if (s_nd[i] == ndl) { idx = i; break; }
+            if (idx < 0 && s_ndn < 128) { idx = s_ndn++; s_nd[idx] = ndl; s_ndc[idx] = 0; s_ndl_logged[idx] = 0; }
+            if (idx >= 0) {
+                s_ndc[idx]++;
+                if ((s_ndc[idx] == 1 || s_ndc[idx] == 300) && !s_ndl_logged[idx]) {
+                    if (s_ndc[idx] == 300) s_ndl_logged[idx] = 1;   // log hot needles at 300 hits
+                    uint16_t w[256]; wg_read_wstr(engine, ndl, w, 256);
+                    char nb[256]; int i = 0; for (; i < 255 && w[i]; i++) nb[i] = (char)(w[i] < 128 ? w[i] : '?'); nb[i] = 0;
+                    uint16_t hw[80]; wg_read_wstr(engine, args64[0], hw, 80);
+                    char hb[80]; int k = 0; for (; k < 79 && hw[k]; k++) hb[k] = (char)(hw[k] < 128 ? hw[k] : '?'); hb[k] = 0;
+                    WG_LOGW(TAG, "wcsstr needle@0x%llX x%u =\"%s\"  haystack@0x%llX=\"%s\"",
+                            (unsigned long long)ndl, s_ndc[idx], nb, (unsigned long long)args64[0], hb);
+                }
             }
         }
 
