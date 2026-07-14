@@ -1922,7 +1922,7 @@ static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t
 // is cheap and gives the UE4 level load room despite exact-size reuse's address
 // fragmentation. Run with WG_LINEAR_GB >= 40 so gsize covers this. Physical RAM
 // (host ~24GB) is the real limit, not this window.
-#define WG_HEAP64_END  0x900000000ULL
+#define WG_HEAP64_END  0x1800000000ULL
 static uint64_t s_heap64_ptr = WG_HEAP64_BASE;
 // Region-3 free list + size tracking so VirtualFree of a large pool RECLAIMS it. Without
 // this, the game's buffer-grow churn (alloc bigger, memcpy, free old) leaks region 3 too
@@ -1950,27 +1950,37 @@ static bool wg_overlaps_live64(uint64_t addr, uint64_t size) {
     }
     return false;
 }
-static uint64_t wg_free_take64(uint64_t size) {
-    // `size` is already page-rounded by the caller; stored free sizes are too.
+// Reuse a freed region-3 block. Returns its base and, via *out_real, the block's
+// REAL size (the caller must track it so the whole block returns on the next free).
+// NEVER SPLITS: a larger free block is handed out WHOLE for a smaller request (the
+// extra tail stays part of this same allocation, unused). Splitting corrupted
+// FMallocBinned2 — carving a freed 103MB block into a 46MB alloc + a 57MB remainder
+// gave the SAME region-3 range to two allocations at inconsistent offsets. Exact-
+// only matching (no split) avoided that but fragmented the address space so badly
+// the window exhausted with only ~767 live allocs; whole-block reuse fixes both:
+// one free block can satisfy any smaller size, keeping the bump pointer bounded.
+static uint64_t wg_free_take64_r(uint64_t size, uint64_t *out_real) {
     uint64_t want = (size + 0xFFFULL) & ~0xFFFULL;
-    // EXACT-size reuse ONLY — never split a free block, never hand part of one
-    // reservation to a different-size request. The game churns fixed-size buffers
-    // (alloc 88MB, copy, free the old 88MB, repeat), so exact reuse recycles those
-    // in place. Best-fit splitting DID cause corruption: a freed 103MB block got
-    // carved into a 46MB alloc + a 57MB remainder, so the SAME region-3 range was
-    // handed out at inconsistent sizes and FMallocBinned2's large-alloc bookkeeping
-    // (canary'd blocks inside it) was invalidated ("realloc an unrecognized block").
-    // Keeping every base a stable single-size allocation avoids that entirely; a
-    // non-matching size just bumps (region 3 is 16GB, and the hot sizes recycle).
-    for (int i = 0; i < s_free64_n; i++) {
+    for (int i = 0; i < s_free64_n; i++) {          // exact first (no wasted tail)
         if (s_free64[i].size == want) {
             uint64_t a = s_free64[i].addr;
             if (wg_overlaps_live64(a, want)) { s_free64[i] = s_free64[--s_free64_n]; s_free64_dropped++; i--; continue; }
+            *out_real = s_free64[i].size;
             s_free64[i] = s_free64[--s_free64_n];
             return a;
         }
     }
-    return 0;
+    for (;;) {                                       // best-fit WHOLE block
+        int best = -1;
+        for (int i = 0; i < s_free64_n; i++)
+            if (s_free64[i].size >= want && (best < 0 || s_free64[i].size < s_free64[best].size)) best = i;
+        if (best < 0) return 0;
+        uint64_t a = s_free64[best].addr, sz = s_free64[best].size;
+        if (wg_overlaps_live64(a, sz)) { s_free64[best] = s_free64[--s_free64_n]; s_free64_dropped++; continue; }
+        *out_real = sz;
+        s_free64[best] = s_free64[--s_free64_n];
+        return a;
+    }
 }
 static void wg_guest_free64(uint64_t addr) {
     if (addr < WG_HEAP64_BASE) return;
@@ -2004,8 +2014,10 @@ static void wg_guest_free64(uint64_t addr) {
 static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align) {
     if (size == 0) size = 1;
     if (align < 0x1000ULL) align = 0x1000ULL;
-    uint64_t reuse = wg_free_take64((size + 0xFFFULL) & ~0xFFFULL);
-    if (reuse) { wg_track_alloc64(reuse, size); return reuse; }
+    uint64_t real = 0;
+    uint64_t reuse = wg_free_take64_r((size + 0xFFFULL) & ~0xFFFULL, &real);
+    // Track the REAL block size (>= requested) so the whole block returns on free.
+    if (reuse) { wg_track_alloc64(reuse, real); return reuse; }
     s_heap64_ptr = (s_heap64_ptr + (align - 1)) & ~(align - 1);
     uint64_t addr = s_heap64_ptr;
     uint64_t alloc = (size + 0xFFFULL) & ~0xFFFULL;
