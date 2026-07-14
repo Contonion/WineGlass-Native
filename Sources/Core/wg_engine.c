@@ -5843,6 +5843,22 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // 64-bit heap (>4GB) once the 1GB 32-bit heap is used up.
             uint64_t va_addr = args64[0], va_size = args64[1];
             uint32_t va_type = args[2];              // MEM_COMMIT=0x1000, MEM_RESERVE=0x2000
+            bool va_is64 = engine->pe_image && engine->pe_image->is_64bit;
+            // Threshold for routing a fresh reservation into the 20GB region-3
+            // (64-bit) heap vs the ~3GB 32-bit heap. A full UE4 level load issues
+            // ~100 large single-buffer allocs just under 32MB (23MB pools, 11.5MB,
+            // 5.77MB, ...) — at a 32MB cutoff they all piled into the 32-bit heap
+            // and OOM'd ("Ran out of memory allocating 23072768 bytes"). Route any
+            // alloc >=1MB to region 3 for 64-bit guests: those are individual large
+            // buffers touched only via the args64-aware bulk handlers
+            // (memcpy/memmove/ReadFile), so >4GB pointers are safe, while the many
+            // sub-1MB FMallocBinned2 pool CHUNKS (whose objects are touched by the
+            // 32-bit-only handlers) stay <4GB. 32-bit guests can't address >4GB, so
+            // they keep everything in the 32-bit heap. map64 commits page-granular,
+            // so no waste. WG_REGION3_MB overrides the 1MB cutoff.
+            uint64_t region3_min = 1ull * 1024 * 1024;
+            if (getenv("WG_REGION3_MB")) region3_min = (uint64_t)atoi(getenv("WG_REGION3_MB")) * 1024 * 1024;
+            if (!va_is64) region3_min = 0xFFFFFFFFFFFFFFFFull;  // 32-bit: never region 3
             if (va_size == 0) {
                 ret_val = 0;                     // Windows: size 0 -> ERROR_INVALID_PARAMETER
                 s_last_error = 87;
@@ -5852,7 +5868,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 if (va_addr >= WG_HEAP64_BASE && (va_type & 0x1000))
                     wg_guest_map64(engine, va_addr, va_size);
                 ret_val = va_addr;
-            } else if (va_size >= 32ull * 1024 * 1024) {
+            } else if (va_size >= region3_min) {
                 // LARGE pool -> region 3 (guest 4..8GB, Path B's extended linear half).
                 // Keeps the game's big FMallocBinned2 pools out of the ~3GB 32-bit heap so
                 // a full UE4 asset load doesn't OOM. Reserve is address-space-only (cheap);
