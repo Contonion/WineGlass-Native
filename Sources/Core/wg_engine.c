@@ -2898,7 +2898,7 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
     // substitution {ENGINE}/{PROJECT}/{PLATFORM}/{USER}...). Auto-stubbed it never
     // found anything, so config init looped forever and the boot never reached the
     // renderer. Uses the FULL 64-bit args (haystacks are short path/config strings).
-    if (!strcmp(fn,"wcsstr")) {
+    if (!strcmp(fn,"wcsstr") && !getenv("WG_NO_WCSSTR")) {
         uint64_t hay = args64[0], nd = args64[1];
         uint16_t needle[1024]; wg_read_wstr(engine, nd, needle, 1024);
         int nlen = 0; while (nlen < 1023 && needle[nlen]) nlen++;
