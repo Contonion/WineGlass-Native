@@ -1786,6 +1786,14 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     // arg-reading handlers would truncate). All addresses stay in uint32_t.
     if (s_heap_ptr + alloc > 0x5F000000u && s_heap_ptr < 0xA0000000u)
         s_heap_ptr = 0xA0000000u;                       // hop to region 2
+    // The 64-bit HLT import-thunk table lives at WG_THUNK_BASE (0xDEAD0000), which is
+    // INSIDE region 2 (0xA0000000..0xF0000000). A heap allocation overlapping it
+    // overwrites the thunks, so every later import call (DeleteObject, ...) jumps into
+    // heap data and executes garbage → the corruption cascade that stalled the UI init.
+    // Keep the thunk region a permanent hole: never allocate across [BASE, BASE+0x20000).
+    if (s_heap_ptr < (uint32_t)(WG_THUNK_BASE + 0x20000u) &&
+        s_heap_ptr + alloc > (uint32_t)WG_THUNK_BASE)
+        s_heap_ptr = (uint32_t)(WG_THUNK_BASE + 0x20000u);   // skip past the thunk hole
     uint32_t hi = (s_heap_ptr >= 0xA0000000u) ? 0xF0000000u : 0x5F000000u;
     if (s_heap_ptr + alloc > hi || s_heap_ptr + alloc < s_heap_ptr) {
         static int s_oom = 0;
@@ -7667,6 +7675,9 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 size = (size + 0xFFF) & ~0xFFF;
                 if (s_heap_ptr + size > 0x5F000000u && s_heap_ptr < 0xA0000000u)
                     s_heap_ptr = 0xA0000000u;   // hop to region 2 (see wg_guest_alloc)
+                if (s_heap_ptr < (uint32_t)(WG_THUNK_BASE + 0x20000u) &&
+                    s_heap_ptr + size > (uint32_t)WG_THUNK_BASE)
+                    s_heap_ptr = (uint32_t)(WG_THUNK_BASE + 0x20000u);  // skip thunk hole
                 uint32_t hi7 = (s_heap_ptr >= 0xA0000000u) ? 0xF0000000u : 0x5F000000u;
                 if (s_heap_ptr + size > hi7 || s_heap_ptr + size < s_heap_ptr) {
                     ret_val = 0; // heap full (both regions)
