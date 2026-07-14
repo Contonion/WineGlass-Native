@@ -188,6 +188,10 @@ static volatile int s_gil_waiters = 0;
 // loading and rarely needs a worker during boot. Main-only publisher (main tick).
 static volatile uint64_t s_main_rip_pub = 0;    // the main guest thread's last RIP
 static volatile unsigned s_main_rip_stall = 0;  // consecutive main slices at the same RIP
+// Monotonic heartbeat bumped once per MAIN tick slice. The deadlock watchdog watches
+// THIS (not the global thunk count) so a worker spinning (SetEvent livelock) can't
+// mask a stalled main thread — the main being frozen IS the deadlock we must break.
+static volatile unsigned long long s_main_tick_pub = 0;
 static volatile int s_main_blocked = 0;         // main is in a genuine blocking wait (release gated workers)
 // WG_CTOR_HOOK: inline entry hook on the UObject base constructor (default 0x9E36E0,
 // called by ALL ~4036 register sites). On each call it GIL-pins the constructing
@@ -9271,12 +9275,15 @@ static void *wg_deadlock_watchdog(void *arg) {
     int do_kick = getenv("WG_DEADLOCK_KICK") != NULL;
     fprintf(stderr, "[watchdog] started (fires after ~%ds near-zero thunk rate, kick=%d)\n", secs, do_kick);
     unsigned long long last = 0; int low = 0, dumped = 0;
+    unsigned long long last_main = 0;
     for (;;) {
         struct timespec ts = {3, 0}; nanosleep(&ts, NULL);
         unsigned long long cur = s_thunk_progress, delta = cur - last; last = cur;
-        // Normal execution is millions of thunks/3s; a deadlock is ~0-hundreds
-        // (a few residual poll-timeouts). Treat < 3000/3s as "stalled".
-        if (delta < 3000) {
+        // The MAIN tick heartbeat: if it froze, the main is deadlocked EVEN IF workers
+        // spin and keep the global thunk count high (the SetEvent-livelock that masked
+        // the deadlock so the kick never fired). Treat a frozen main as stalled too.
+        unsigned long long cur_main = s_main_tick_pub, dmain = cur_main - last_main; last_main = cur_main;
+        if (delta < 3000 || dmain == 0) {
             low += 3;
             if (low >= secs) {
                 if (!dumped) {
@@ -9741,6 +9748,7 @@ void wg_engine_tick(WGEngine *engine) {
         { uint64_t mr = wg_blink_get_rip(engine->blink);
           if (mr == s_main_rip_pub) { if (s_main_rip_stall < 1000000) s_main_rip_stall++; }
           else { s_main_rip_pub = mr; s_main_rip_stall = 0; } }
+        s_main_tick_pub++;   // main-tick heartbeat for the deadlock watchdog
         wg_thunk_unlock();
         s_okstreak = (r == WG_BLINK_OK) ? s_okstreak + 1 : 0;
         // Fairness (real-threads): the main guest thread runs here; without a yield
