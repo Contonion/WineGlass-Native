@@ -1917,7 +1917,12 @@ static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t
 // linear region). Large VirtualAlloc pools live here so they don't exhaust the sub-4GB
 // 32-bit heap. Capped at 8GB (the linear region end) — a reserve past it fails cleanly.
 #define WG_HEAP64_BASE 0x100000000ULL
-#define WG_HEAP64_END  0x4FFF00000ULL
+// Region-3 spans 4GB..~36GB of the linear space. It's ADDRESS SPACE only (lazy
+// mmap) — physical cost is just the committed+touched pages — so a large window
+// is cheap and gives the UE4 level load room despite exact-size reuse's address
+// fragmentation. Run with WG_LINEAR_GB >= 40 so gsize covers this. Physical RAM
+// (host ~24GB) is the real limit, not this window.
+#define WG_HEAP64_END  0x900000000ULL
 static uint64_t s_heap64_ptr = WG_HEAP64_BASE;
 // Region-3 free list + size tracking so VirtualFree of a large pool RECLAIMS it. Without
 // this, the game's buffer-grow churn (alloc bigger, memcpy, free old) leaks region 3 too
@@ -5953,14 +5958,17 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // they keep everything in the 32-bit heap. map64 commits page-granular,
             // so no waste. WG_REGION3_MB overrides the cutoff.
             //
-            // Cutoff is 20MB, NOT 1MB: FMallocBinned2's pool chunks (the repetitive
-            // 1..17MB allocs) carry canary'd block metadata and internal pointers
-            // that flow through many 32-bit-only Win32 handlers; at >4GB those
-            // pointers get truncated, corrupting the pool ("realloc an unrecognized
-            // block ... canary==0"). Only the large RAW data buffers (23/46/88MB,
-            // touched solely by the args64-safe memcpy/memmove/ReadFile) are safe in
-            // region 3 — and those are exactly what overflowed the 32-bit heap.
-            uint64_t region3_min = 20ull * 1024 * 1024;
+            // Cutoff is 1MB. The FMallocBinned2 "realloc an unrecognized block"
+            // corruption that first appeared at a 1MB cutoff was NOT pointer
+            // truncation — it was CROSS-SIZE free-list reuse (a 103MB block split
+            // into a 46MB alloc) making FMallocBinned2's internal block offsets
+            // inconsistent. Now that region-3 reuse is EXACT-size only, a base is
+            // always reallocated at the same size, so pools stay consistent and are
+            // safe in region 3. Keeping the cutoff low is REQUIRED: at 20MB the
+            // 1..20MB allocs piled into the ~3GB 32-bit heap and OOM'd mid-load
+            // ("Ran out of memory allocating 11538432 bytes"). Only tiny (<1MB)
+            // FMallocBinned2 pool chunks stay in the 32-bit heap. WG_REGION3_MB overrides.
+            uint64_t region3_min = 1ull * 1024 * 1024;
             if (getenv("WG_REGION3_MB")) region3_min = (uint64_t)atoi(getenv("WG_REGION3_MB")) * 1024 * 1024;
             if (!va_is64) region3_min = 0xFFFFFFFFFFFFFFFFull;  // 32-bit: never region 3
             if (va_size == 0) {
