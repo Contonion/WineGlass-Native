@@ -1903,7 +1903,7 @@ static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t
 // linear region). Large VirtualAlloc pools live here so they don't exhaust the sub-4GB
 // 32-bit heap. Capped at 8GB (the linear region end) — a reserve past it fails cleanly.
 #define WG_HEAP64_BASE 0x100000000ULL
-#define WG_HEAP64_END  0x1FFF00000ULL
+#define WG_HEAP64_END  0x3FFF00000ULL
 static uint64_t s_heap64_ptr = WG_HEAP64_BASE;
 // Region-3 free list + size tracking so VirtualFree of a large pool RECLAIMS it. Without
 // this, the game's buffer-grow churn (alloc bigger, memcpy, free old) leaks region 3 too
@@ -4429,7 +4429,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 uint16_t arch = 9; memcpy(si + 0, &arch, 2);   // PROCESSOR_ARCHITECTURE_AMD64
                 v32 = 4096;        memcpy(si + 4,  &v32, 4);   // dwPageSize
                 v64 = 0x00010000;  memcpy(si + 8,  &v64, 8);   // lpMinimumApplicationAddress
-                v64 = 0x1FF000000ULL; memcpy(si + 16, &v64, 8);  // lpMaximumApplicationAddress (~8GB — must cover region 3 (guest 4..8GB) where large VirtualAlloc pools live, so FMallocBinned2 accepts those pool pointers; Path B's linear region is 8GB)
+                v64 = 0x3FF000000ULL; memcpy(si + 16, &v64, 8);  // lpMaximumApplicationAddress (~16GB — must cover region 3 (guest 4..16GB) where large VirtualAlloc pools live, so FMallocBinned2 accepts those pool pointers; Path B's linear region is 16GB)
                 v64 = wg_cpumask(); memcpy(si + 24, &v64, 8);  // dwActiveProcessorMask
                 v32 = wg_ncpu();   memcpy(si + 32, &v32, 4);   // dwNumberOfProcessors
                 v32 = 8664;        memcpy(si + 36, &v32, 4);   // dwProcessorType
@@ -5721,7 +5721,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // only MEM_COMMIT backs pages. Its pointers flow through the args64-aware
                 // mem handlers. Falls back to the 32-bit heap if region 3 is full.
                 uint64_t a = wg_guest_reserve64(va_size, 0x10000);
-                if (a && (va_type & 0x1000)) { if (!wg_guest_map64(engine, a, va_size)) a = 0; }
+                int mapped = 1;
+                if (a && (va_type & 0x1000)) { mapped = wg_guest_map64(engine, a, va_size); if (!mapped) a = 0; }
+                if (!a) WG_LOGW(TAG, "region3 FAIL size=%llu reserve=%s heap64_ptr=0x%llX free64=%d",
+                                (unsigned long long)va_size, mapped ? "0(full)" : "map-failed",
+                                (unsigned long long)s_heap64_ptr, s_free64_n);
                 ret_val = a ? a : wg_guest_alloc_aligned(engine, (uint32_t)va_size, 0x10000);
             } else {
                 // Fresh small reservation: align to the OS allocation granularity (64KB).
@@ -10675,6 +10679,23 @@ void wg_engine_tick(WGEngine *engine) {
                 break;
             case WG_BLINK_ERROR:
                 { wg_thunk_lock(); bool _htk = handle_blink_thunk(engine); wg_thunk_unlock(); if (_htk) break; }
+                // WG_ABORT_CONTINUE: limp past a guest abort/crash instead of stopping.
+                // The Visage boot reaches Slate UI init then LowLevelFatalError's on a
+                // missing Engine asset (curve compression settings) whose handler then
+                // crashes. Those assets aren't needed to draw the title-screen UI, so
+                // skip the faulting instruction and keep running to try to reach a
+                // rendered frame. Bounded so a genuine infinite crash-loop still stops.
+                if (getenv("WG_ABORT_CONTINUE")) {
+                    static int s_limp = 0;
+                    uint64_t crip = wg_blink_get_rip(engine->blink);
+                    if (s_limp < 20000) {
+                        if ((s_limp++ % 500) == 0)
+                            WG_LOGW(TAG, "WG_ABORT_CONTINUE: limping past crash #%d @RIP=0x%llx",
+                                    s_limp, (unsigned long long)crip);
+                        wg_blink_set_rip(engine->blink, crip + 1);   // skip faulting byte, retry decode
+                        break;
+                    }
+                }
                 WG_LOGE(TAG, "Crash at RIP=0x%llx",
                         (unsigned long long)wg_blink_get_rip(engine->blink));
                 engine->state = WG_ENGINE_STOPPED;

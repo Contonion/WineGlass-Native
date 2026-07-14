@@ -149,10 +149,12 @@ static void ensure_initialized(void) {
         FLAG_nolinear = false;
         {
             extern void *wg_linear_base; extern unsigned long long wg_linear_size;
-            // 8GB: the low 4GB is the 32-bit guest VA; the 4..8GB half backs the large
-            // VirtualAlloc pools (region 3) so a full UE4 asset load doesn't OOM the
-            // 32-bit heap. WG_LINEAR_GB overrides (in GB) if a host can't reserve 8GB.
-            unsigned long long gsize = 0x200000000ULL;
+            // 16GB: the low 4GB is the 32-bit guest VA; the 4..16GB upper part backs the
+            // large VirtualAlloc pools (region 3) — a full UE4 asset load reserves a
+            // multi-GB streaming pool + several GB of live pools, which don't fit in the
+            // sub-4GB 32-bit heap. Reservation is address space only (lazy commit), so the
+            // host only pays for touched pages. WG_LINEAR_GB overrides (in GB).
+            unsigned long long gsize = 0x400000000ULL;
             if (getenv("WG_LINEAR_GB")) gsize = (unsigned long long)atoi(getenv("WG_LINEAR_GB")) << 30;
             void *want = (void *)(uintptr_t)kSkew;
             void *got = Mmap(want, gsize, PROT_READ | PROT_WRITE,
