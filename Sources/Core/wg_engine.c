@@ -2953,6 +2953,32 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
     }
     if (!strcmp(fn,"wcschr")) { uint16_t s[4096]; wg_read_wstr(engine,A0,s,4096); int i=0; for(;;i++){ if(s[i]==(uint16_t)A1){ *ret=A0+(uint32_t)i*2; return true; } if(!s[i])break; } *ret=0; return true; }
     if (!strcmp(fn,"wcsrchr")){ uint16_t s[4096]; wg_read_wstr(engine,A0,s,4096); int last=-1,i=0; for(;;i++){ if(s[i]==(uint16_t)A1)last=i; if(!s[i])break; } *ret=last>=0?A0+(uint32_t)last*2:0; return true; }
+    if (!strcmp(fn,"wcsstr")) {
+        // wchar_t *wcsstr(haystack=A0, needle=A1). Was auto-stubbed to a constant,
+        // so every substring search returned a wrong result — a hot path in the UE4
+        // level load. Scan the haystack in overlapping windows, stopping at its NUL
+        // terminator (a proper wide string is short even if its buffer is huge), and
+        // return the guest pointer of the match or 0. Bounded so a non-terminated
+        // buffer can't hang.
+        uint16_t needle[1024]; wg_read_wstr(engine, A1, needle, 1024);
+        int nlen = 0; while (nlen < 1023 && needle[nlen]) nlen++;
+        if (nlen == 0) { *ret = A0; return true; }         // empty needle -> haystack
+        const int WIN = 8192;
+        uint16_t win[WIN];
+        uint32_t gpos = 0; const uint32_t MAXSCAN = 32u * 1024 * 1024; // 32M wide chars
+        while (gpos < MAXSCAN) {
+            wg_blink_read_mem(engine->blink, (uint64_t)A0 + (uint64_t)gpos * 2, win, WIN * 2);
+            int valid = 0; while (valid < WIN && win[valid]) valid++;   // chars before NUL
+            int limit = valid - nlen;
+            for (int i = 0; i <= limit; i++) {
+                int j = 0; while (j < nlen && win[i + j] == needle[j]) j++;
+                if (j == nlen) { *ret = (uint64_t)A0 + (uint64_t)(gpos + i) * 2; return true; }
+            }
+            if (valid < WIN) { *ret = 0; return true; }    // hit NUL -> not found
+            gpos += WIN - (nlen - 1);                       // keep overlap for cross-window matches
+        }
+        *ret = 0; return true;
+    }
     if (!strcmp(fn,"wcscpy")) { uint16_t s[4096]; wg_read_wstr(engine,A1,s,4096); int l=0; while(s[l])l++; wg_blink_write_mem(engine->blink,A0,s,(uint32_t)(l+1)*2); *ret=A0; return true; }
     if (!strcmp(fn,"wcsncpy")){ uint16_t s[4096]; wg_read_wstr(engine,A1,s,4096); uint32_t n=A2; uint16_t *o=calloc(n?n:1,2); if(o){ int l=0; while(s[l])l++; for(uint32_t i=0;i<n;i++)o[i]=((uint32_t)i<(uint32_t)l)?s[i]:0; wg_blink_write_mem(engine->blink,A0,o,n*2); free(o);} *ret=A0; return true; }
 
