@@ -6139,6 +6139,17 @@ static bool handle_blink_thunk(WGEngine *engine) {
                         ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%llX ", (unsigned long long)v);
                 }
                 WG_LOGW(TAG, "IMGWRITE stack .text chain: %s", chain);
+                // Dump the candidate FString object (RSI) + RBX object to see the
+                // type confusion: is RSI a valid heap FString whose Data was set to a
+                // code address, or is RSI itself bogus?
+                uint64_t rsi = wg_blink_get_reg(engine->blink, 6);
+                uint64_t rbx = wg_blink_get_reg(engine->blink, 3);
+                uint64_t f[4] = {0}; wg_blink_read_mem(engine->blink, rsi, f, 32);
+                WG_LOGW(TAG, "IMGWRITE RSI=0x%llX [+0]=0x%llX(Data) [+8]=0x%llX(Num/Max) [+0x10]=0x%llX  RBX=0x%llX",
+                        (unsigned long long)rsi, (unsigned long long)f[0], (unsigned long long)f[1],
+                        (unsigned long long)f[2], (unsigned long long)rbx);
+                uint64_t bx0 = 0; wg_blink_read_mem(engine->blink, rbx, &bx0, 8);
+                WG_LOGW(TAG, "IMGWRITE [RBX+0]=0x%llX", (unsigned long long)bx0);
             }
             if (dst && src && n && n <= 64u * 1024 * 1024) {
                 // Fast direct guest->guest copy (no malloc) — default ON (see memset).
