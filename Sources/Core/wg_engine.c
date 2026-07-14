@@ -219,6 +219,7 @@ static struct { uint64_t addr; uint8_t reg; uint8_t off; uint8_t orig; bool arme
     { 0xA5AC68, 3, 0x28, 0, false },   // ProcessNewlyLoadedUObjects: mov rbx,[rbx+0x28]
     { 0x6FB9A4, 3, 0x28, 0, false },   // FUObjectHashTables iterator: mov rbx,[rbx+0x28]
     { 0xB7BD93, 0, 0x20, 0, false },   // outer-chain walk (error path): mov rax,[rax+0x20]
+    { 0x9FFD32, 1, 0x28, 0, false },   // reflection-drain walk (JIT path): mov rcx,[rcx+0x28]
 };
 #define WG_NLOOPS ((int)(sizeof(s_loops)/sizeof(s_loops[0])))
 static bool     s_loop_armed = false;
