@@ -1941,6 +1941,13 @@ static void wg_track_alloc64(uint64_t addr, uint64_t size) {
 // A free entry that overlaps a live alloc is corrupt (a stale/double free), so we
 // drop it rather than trust it.
 static uint64_t s_free64_dropped = 0;
+// Set once the guest reaches RHI init (D3D11CreateDevice). Before this, wcsstr must
+// stay auto-stubbed: correct wcsstr makes UE4's config/module init take a path that
+// hits a type-confusion crash (realloc of a PE-static pointer, 0x680000). AFTER RHI,
+// correct wcsstr is needed — the UObject drain does a degenerate O(N^2) name lookup
+// via wcsstr, and auto-stub (never finding) makes it rescan forever. Correct wcsstr
+// short-circuits it -> the drain actually completes and reaches the menu.
+static bool s_rhi_up = false;
 static bool wg_overlaps_live64(uint64_t addr, uint64_t size) {
     uint64_t end = addr + size;
     for (int i = 0; i < s_alloc64_n; i++) {
@@ -2898,7 +2905,14 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
     // substitution {ENGINE}/{PROJECT}/{PLATFORM}/{USER}...). Auto-stubbed it never
     // found anything, so config init looped forever and the boot never reached the
     // renderer. Uses the FULL 64-bit args (haystacks are short path/config strings).
-    if (!strcmp(fn,"wcsstr") && !getenv("WG_NO_WCSSTR")) {
+    // wcsstr: DEFAULT is auto-stub — that's the working boot path. Correct wcsstr
+    // exposes latent translation bugs: WG_WCSSTR_ALWAYS crashes config init
+    // (0x680000 type-confusion); WG_WCSSTR_AFTER_RHI (correct only once s_rhi_up)
+    // clears config but then the drain gets wrong config values (anim-compression
+    // fatal, empty UnrealEd class). Kept opt-in for future debugging of those bugs;
+    // the degenerate O(N^2) drain lookup remains the reason to eventually fix it.
+    if (!strcmp(fn,"wcsstr") &&
+        (getenv("WG_WCSSTR_ALWAYS") || (s_rhi_up && getenv("WG_WCSSTR_AFTER_RHI")))) {
         uint64_t hay = args64[0], nd = args64[1];
         uint16_t needle[1024]; wg_read_wstr(engine, nd, needle, 1024);
         int nlen = 0; while (nlen < 1023 && needle[nlen]) nlen++;
@@ -3895,6 +3909,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // Handle specific Win32 functions that affect visual output
     if (entry) {
         const char *fn = entry->func_name;
+
+        // Mark RHI init reached so wcsstr switches to its correct impl (see s_rhi_up).
+        if (!s_rhi_up && (!strcmp(fn, "D3D11CreateDevice") ||
+                          !strcmp(fn, "CreateDXGIFactory1") ||
+                          !strcmp(fn, "CreateDXGIFactory"))) {
+            s_rhi_up = true;
+            WG_LOGW(TAG, "RHI up -> wcsstr now uses correct impl (fast UObject drain)");
+        }
 
         // Capture MessageBox text — UE4's fatal-error path pops a MessageBox
         // ("Assertion failed", "Fatal error", missing-content, etc.) right
