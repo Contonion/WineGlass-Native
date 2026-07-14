@@ -83,6 +83,8 @@ int wg_sync_kick_workers(void) {
     static signed char kickall = -1, kickman = -1;
     if (kickall < 0) kickall = getenv("WG_DEADLOCK_KICKALL") ? 1 : 0;   // include main (tid 1)
     if (kickman < 0) kickman = getenv("WG_DEADLOCK_KICKMANUAL") ? 1 : 0; // include manual-reset events
+    static signed char kickcv = -1;
+    if (kickcv < 0) kickcv = getenv("WG_DEADLOCK_KICKCV") ? 1 : 0; // also wake all CVs
     pthread_mutex_lock(&g_lock);
     int kicked = 0;
     for (int i = 0; i < 128; i++) {
@@ -90,6 +92,14 @@ int wg_sync_kick_workers(void) {
         if (!kickall && s_waitq[i].tid == 1) continue;
         WGSyncObj *o = find_locked(s_waitq[i].handle);
         if (o && o->type == WGO_EVENT && (kickman || !o->manual) && !o->signalled) { o->signalled = true; kicked++; }
+    }
+    // A lost WakeConditionVariable leaves SleepConditionVariableCS parked and does NOT
+    // appear in s_waitq (CV sleeps wait on the CV's generation, not a handle). Bump
+    // every CV's generation so all parked waiters re-check their predicate — a
+    // spurious wake is safe under Win32 CV semantics (the guest re-tests + re-sleeps).
+    if (kickcv) {
+        for (int i = 0; i < WG_SYNC_MAX; i++)
+            if (g_objs[i].type == WGO_CV) { g_objs[i].count++; kicked++; }
     }
     if (kicked) pthread_cond_broadcast(&g_cond);
     pthread_mutex_unlock(&g_lock);

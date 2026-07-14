@@ -3097,8 +3097,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
         // once and silently die (the bug that let the corruption persist). Keeping the
         // HLT means the block stays cached as a halt and traps on every construction.
         static unsigned long long s_ctor_hits = 0;
-        if ((++s_ctor_hits % 50000ULL) == 1)
-            WG_LOGW(TAG, "WG_CTOR_HOOK: %llu constructions serialized", s_ctor_hits);
+        if ((++s_ctor_hits % 5000ULL) == 1) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            WG_LOGW(TAG, "WG_CTOR_HOOK: %llu constructions @ %ld.%03lds (rate probe)",
+                    s_ctor_hits, (long)_ts.tv_sec, _ts.tv_nsec/1000000);
+        }
         uint64_t crsp = wg_blink_get_reg(engine->blink, 4);
         uint64_t crbx = wg_blink_get_reg(engine->blink, 3);
         wg_blink_write_mem(engine->blink, (uint32_t)(crsp + 8), &crbx, 8);
