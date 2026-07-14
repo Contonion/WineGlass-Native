@@ -1925,16 +1925,43 @@ static uint64_t s_heap64_ptr = WG_HEAP64_BASE;
 #define WG_MAX_ALLOC64 8192
 static struct { uint64_t addr; uint64_t size; } s_alloc64[WG_MAX_ALLOC64]; static int s_alloc64_n = 0;
 static struct { uint64_t addr; uint64_t size; } s_free64[WG_MAX_ALLOC64];  static int s_free64_n = 0;
+static void wg_uncommit64(uint64_t addr, uint64_t size);  // fwd: clears commit bits
 static void wg_track_alloc64(uint64_t addr, uint64_t size) {
     if (s_alloc64_n < WG_MAX_ALLOC64) { s_alloc64[s_alloc64_n].addr = addr; s_alloc64[s_alloc64_n].size = size; s_alloc64_n++; }
 }
+// True if [addr, addr+size) overlaps any currently-LIVE region-3 allocation.
+// The reuse path must never hand back a block that overlaps a live alloc — doing
+// so double-allocates the range and map64's zero-fill wipes the live block's
+// contents (seen as FMallocBinned2 "realloc an unrecognized block ... canary==0").
+// A free entry that overlaps a live alloc is corrupt (a stale/double free), so we
+// drop it rather than trust it.
+static uint64_t s_free64_dropped = 0;
+static bool wg_overlaps_live64(uint64_t addr, uint64_t size) {
+    uint64_t end = addr + size;
+    for (int i = 0; i < s_alloc64_n; i++) {
+        uint64_t a = s_alloc64[i].addr;
+        uint64_t e = a + ((s_alloc64[i].size + 0xFFFULL) & ~0xFFFULL);
+        if (addr < e && a < end) return true;
+    }
+    return false;
+}
 static uint64_t wg_free_take64(uint64_t size) {
-    uint64_t take = (size + 0xFFFFULL) & ~0xFFFFULL;   // 64KB granularity (see wg_free_list_take)
+    // `size` is already page-rounded by the caller; stored free sizes are too.
+    uint64_t want = (size + 0xFFFULL) & ~0xFFFULL;
+    // EXACT-size reuse ONLY — never split a free block, never hand part of one
+    // reservation to a different-size request. The game churns fixed-size buffers
+    // (alloc 88MB, copy, free the old 88MB, repeat), so exact reuse recycles those
+    // in place. Best-fit splitting DID cause corruption: a freed 103MB block got
+    // carved into a 46MB alloc + a 57MB remainder, so the SAME region-3 range was
+    // handed out at inconsistent sizes and FMallocBinned2's large-alloc bookkeeping
+    // (canary'd blocks inside it) was invalidated ("realloc an unrecognized block").
+    // Keeping every base a stable single-size allocation avoids that entirely; a
+    // non-matching size just bumps (region 3 is 16GB, and the hot sizes recycle).
     for (int i = 0; i < s_free64_n; i++) {
-        if (s_free64[i].size >= take) {
-            uint64_t a = s_free64[i].addr, rem = s_free64[i].size - take;
-            if (rem >= 0x10000ULL) { s_free64[i].addr = a + take; s_free64[i].size = rem; }
-            else s_free64[i] = s_free64[--s_free64_n];
+        if (s_free64[i].size == want) {
+            uint64_t a = s_free64[i].addr;
+            if (wg_overlaps_live64(a, want)) { s_free64[i] = s_free64[--s_free64_n]; s_free64_dropped++; i--; continue; }
+            s_free64[i] = s_free64[--s_free64_n];
             return a;
         }
     }
@@ -1943,9 +1970,28 @@ static uint64_t wg_free_take64(uint64_t size) {
 static void wg_guest_free64(uint64_t addr) {
     if (addr < WG_HEAP64_BASE) return;
     uint64_t size = 0;
-    for (int i = s_alloc64_n - 1; i >= 0; i--) if (s_alloc64[i].addr == addr) { size = s_alloc64[i].size; break; }
+    // Find the live alloc AND REMOVE it (swap-with-last). Previously this only
+    // read the size and left the entry in place, so s_alloc64_n grew by one on
+    // every alloc/free cycle (the reuse path re-appends too). A level load
+    // churns the same ~100 88MB buffers thousands of times, so s_alloc64
+    // overflowed WG_MAX_ALLOC64; past that, wg_track_alloc64 silently dropped
+    // new allocs, their frees found no size, nothing was reclaimed, and the
+    // region-3 bump pointer climbed to the 20GB cap and fell back to the (tiny)
+    // 32-bit heap -> OOM. Removing on free keeps s_alloc64_n = live count.
+    for (int i = s_alloc64_n - 1; i >= 0; i--) if (s_alloc64[i].addr == addr) {
+        size = s_alloc64[i].size;
+        s_alloc64[i] = s_alloc64[--s_alloc64_n];
+        break;
+    }
     if (!size) return;
     size = (size + 0xFFFULL) & ~0xFFFULL;
+    // Released pages return to the OS: mark them uncommitted so that when this
+    // block is handed out again, its pages are re-zeroed on commit (Windows gives
+    // zeroed memory for a fresh commit of a re-reserved range).
+    wg_uncommit64(addr, size);
+    // Duplicate-free guard: never let the same base sit in the free list twice
+    // (a double VirtualFree would otherwise hand the range out to two allocs).
+    for (int i = 0; i < s_free64_n; i++) if (s_free64[i].addr == addr) return;
     if (s_free64_n < WG_MAX_ALLOC64) { s_free64[s_free64_n].addr = addr; s_free64[s_free64_n].size = size; s_free64_n++; }
 }
 // Reserve address space only (NO backing map) — a MEM_RESERVE, so a multi-GB
@@ -1964,19 +2010,69 @@ static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align) {
     wg_track_alloc64(addr, size);
     return addr;
 }
-// Commit: back [addr,addr+size) with real zeroed pages in blink (<=4MB chunks).
-static bool wg_guest_map64(WGEngine *engine, uint64_t addr, uint64_t size) {
-    uint64_t alloc = (size + 0xFFFULL) & ~0xFFFULL;
+// Region-3 commit bitmap: 1 bit per 4KB page over [WG_HEAP64_BASE, WG_HEAP64_END).
+// Windows VirtualAlloc(MEM_COMMIT) zeroes a page only on its FIRST commit; a
+// redundant commit of already-committed pages is a no-op that must NOT re-zero
+// them. FMallocBinned2's OS page cache re-commits live pool ranges, so our old
+// unconditional zero wiped canaries across the whole region-3 pool space
+// ("FMallocBinned2 realloc an unrecognized block ... canary==0"). Track commit
+// state so we zero each page exactly once per commit-cycle.
+#define WG_PAGE64 0x1000ULL
+static uint8_t *s_commit_bm = NULL;
+static size_t wg_bm_bytes(void) { return (size_t)(((WG_HEAP64_END - WG_HEAP64_BASE) / WG_PAGE64 + 7) / 8); }
+static bool wg_page_committed(uint64_t pg) { return s_commit_bm && (s_commit_bm[pg >> 3] & (1u << (pg & 7))); }
+static void wg_page_mark(uint64_t pg, bool v) {
+    if (!s_commit_bm) return;
+    if (v) s_commit_bm[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+    else   s_commit_bm[pg >> 3] &= (uint8_t)~(1u << (pg & 7));
+}
+static void wg_zero_range64(WGEngine *engine, uint64_t addr, uint64_t len) {
     uint64_t off = 0;
-    while (off < alloc) {
-        uint64_t chunk = alloc - off; if (chunk > 0x400000ULL) chunk = 0x400000ULL;
+    while (off < len) {
+        uint64_t chunk = len - off; if (chunk > 0x400000ULL) chunk = 0x400000ULL;
         uint8_t *zeros = calloc(1, (size_t)chunk);
-        if (!zeros) return false;
+        if (!zeros) return;
         wg_blink_load_code(engine->blink, addr + off, zeros, (uint32_t)chunk, 0);
         free(zeros);
         off += chunk;
     }
+}
+// Commit: back [addr,addr+size) with zeroed pages, but zero ONLY the pages not
+// already committed (see above). Returns true on success.
+static bool wg_guest_map64(WGEngine *engine, uint64_t addr, uint64_t size) {
+    uint64_t start = addr & ~0xFFFULL;
+    uint64_t end = (addr + size + 0xFFFULL) & ~0xFFFULL;
+    if (!s_commit_bm) s_commit_bm = calloc(1, wg_bm_bytes());
+    // Outside the tracked region (or bitmap alloc failed): old unconditional zero.
+    if (!s_commit_bm || start < WG_HEAP64_BASE || end > WG_HEAP64_END) {
+        wg_zero_range64(engine, start, end - start);
+        return true;
+    }
+    uint64_t p = start;
+    while (p < end) {
+        uint64_t pg = (p - WG_HEAP64_BASE) / WG_PAGE64;
+        if (wg_page_committed(pg)) { p += WG_PAGE64; continue; }  // live page: preserve it
+        uint64_t run = p;
+        while (p < end) {
+            uint64_t pg2 = (p - WG_HEAP64_BASE) / WG_PAGE64;
+            if (wg_page_committed(pg2)) break;
+            wg_page_mark(pg2, true);
+            p += WG_PAGE64;
+        }
+        wg_zero_range64(engine, run, p - run);   // zero the freshly-committed run
+    }
     return true;
+}
+// Decommit / release: mark pages uncommitted so a later commit re-zeroes them
+// (matches Windows: memory read after decommit+recommit comes back zeroed).
+static void wg_uncommit64(uint64_t addr, uint64_t size) {
+    if (!s_commit_bm) return;
+    uint64_t start = addr & ~0xFFFULL;
+    uint64_t end = (addr + size + 0xFFFULL) & ~0xFFFULL;
+    if (start < WG_HEAP64_BASE) start = WG_HEAP64_BASE;
+    if (end > WG_HEAP64_END) end = WG_HEAP64_END;
+    for (uint64_t p = start; p < end; p += WG_PAGE64)
+        wg_page_mark((p - WG_HEAP64_BASE) / WG_PAGE64, false);
 }
 
 // ===== nsDialogs plugin emulation =======================================
@@ -5855,8 +5951,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // sub-1MB FMallocBinned2 pool CHUNKS (whose objects are touched by the
             // 32-bit-only handlers) stay <4GB. 32-bit guests can't address >4GB, so
             // they keep everything in the 32-bit heap. map64 commits page-granular,
-            // so no waste. WG_REGION3_MB overrides the 1MB cutoff.
-            uint64_t region3_min = 1ull * 1024 * 1024;
+            // so no waste. WG_REGION3_MB overrides the cutoff.
+            //
+            // Cutoff is 20MB, NOT 1MB: FMallocBinned2's pool chunks (the repetitive
+            // 1..17MB allocs) carry canary'd block metadata and internal pointers
+            // that flow through many 32-bit-only Win32 handlers; at >4GB those
+            // pointers get truncated, corrupting the pool ("realloc an unrecognized
+            // block ... canary==0"). Only the large RAW data buffers (23/46/88MB,
+            // touched solely by the args64-safe memcpy/memmove/ReadFile) are safe in
+            // region 3 — and those are exactly what overflowed the 32-bit heap.
+            uint64_t region3_min = 20ull * 1024 * 1024;
             if (getenv("WG_REGION3_MB")) region3_min = (uint64_t)atoi(getenv("WG_REGION3_MB")) * 1024 * 1024;
             if (!va_is64) region3_min = 0xFFFFFFFFFFFFFFFFull;  // 32-bit: never region 3
             if (va_size == 0) {
@@ -5877,9 +5981,10 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 uint64_t a = wg_guest_reserve64(va_size, 0x10000);
                 int mapped = 1;
                 if (a && (va_type & 0x1000)) { mapped = wg_guest_map64(engine, a, va_size); if (!mapped) a = 0; }
-                if (!a) WG_LOGW(TAG, "region3 FAIL size=%llu reserve=%s heap64_ptr=0x%llX free64=%d",
+                if (!a) WG_LOGW(TAG, "region3 FAIL size=%llu reserve=%s heap64_ptr=0x%llX free64=%d live=%d dropped=%llu",
                                 (unsigned long long)va_size, mapped ? "0(full)" : "map-failed",
-                                (unsigned long long)s_heap64_ptr, s_free64_n);
+                                (unsigned long long)s_heap64_ptr, s_free64_n, s_alloc64_n,
+                                (unsigned long long)s_free64_dropped);
                 ret_val = a ? a : wg_guest_alloc_aligned(engine, (uint32_t)va_size, 0x10000);
             } else {
                 // Fresh small reservation: align to the OS allocation granularity (64KB).
@@ -5900,6 +6005,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (args[2] & 0x8000) {
                 if (args64[0] >= WG_HEAP64_BASE) wg_guest_free64(args64[0]);
                 else wg_guest_free((uint32_t)args64[0], 0);
+            } else if ((args[2] & 0x4000) && args64[0] >= WG_HEAP64_BASE) {
+                // MEM_DECOMMIT of a region-3 sub-range: mark it uncommitted so a
+                // later re-commit re-zeroes it (Windows semantics), matching the
+                // commit-once bitmap. The reservation itself stays reserved.
+                wg_uncommit64(args64[0], args64[1] ? args64[1] : 0x1000);
             }
             ret_val = 1;   // TRUE
         } else if (strcmp(fn, "??2@YAPAXI@Z") == 0 ||   // operator new(uint)
