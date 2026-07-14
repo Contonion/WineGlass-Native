@@ -945,6 +945,16 @@ static bool s_nsis_data_patched = false;
 #define WG_GUEST_HEAP_BASE 0x20000000u
 static uint32_t s_heap_ptr = WG_GUEST_HEAP_BASE;
 
+// File mappings (CreateFileMapping + MapViewOfFile). UE4's FPakPrecacher / memory-
+// mapped file path maps the pak files and reads pak blocks straight from the mapped
+// memory. These were stub_default (returned 0/NULL), so the mapping "failed" and the
+// precacher spun forever on unavailable data (the post-swapchain load stall). We back
+// a mapped VIEW by allocating guest memory and reading the file region into it (paks
+// are read-only — no write-back needed). Mapping handle = WG_FILEMAP_BASE + slot.
+#define WG_MAX_FILEMAP 128
+#define WG_FILEMAP_BASE 0x00FE0000u
+static struct { uint8_t used; uint32_t file_handle; } s_filemap[WG_MAX_FILEMAP];
+
 // Dynamic TLS (TlsAlloc/TlsGetValue/TlsSetValue) and FLS. These are PER-THREAD:
 // the slot *index* is process-global, but each thread has its own value array.
 // A global array made the MSVC CRT's per-thread data block (kept in FLS slot 1)
@@ -7155,6 +7165,55 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 s_diag_data_tmp_handle = (uint32_t)ret_val;
             }
 #endif
+        } else if (strcmp(fn, "CreateFileMappingW") == 0 || strcmp(fn, "CreateFileMappingA") == 0) {
+            // CreateFileMapping(hFile, lpAttrs, flProtect, dwMaxSizeHigh, dwMaxSizeLow, lpName)
+            // Record the underlying file handle; the actual data is served in MapViewOfFile.
+            uint32_t hfile = args[0];
+            ret_val = 0;
+            if (hfile) {
+                for (int i = 0; i < WG_MAX_FILEMAP; i++) if (!s_filemap[i].used) {
+                    s_filemap[i].used = 1; s_filemap[i].file_handle = hfile;
+                    ret_val = WG_FILEMAP_BASE + (uint32_t)i;
+                    WG_LOGI(TAG, "CreateFileMapping(file=0x%X) -> mapping 0x%llX",
+                            hfile, (unsigned long long)ret_val);
+                    break;
+                }
+            }
+            if (!ret_val) s_last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+        } else if (strcmp(fn, "MapViewOfFile") == 0 || strcmp(fn, "MapViewOfFileEx") == 0) {
+            // MapViewOfFile(hMap, dwAccess, dwOffHigh, dwOffLow, dwNumberOfBytes[, lpBase])
+            uint32_t hmap = args[0];
+            uint64_t offset = ((uint64_t)args[2] << 32) | args[3];
+            uint32_t size = args[4];
+            ret_val = 0;
+            if (hmap >= WG_FILEMAP_BASE && hmap < WG_FILEMAP_BASE + WG_MAX_FILEMAP
+                && s_filemap[hmap - WG_FILEMAP_BASE].used) {
+                uint32_t fh = s_filemap[hmap - WG_FILEMAP_BASE].file_handle;
+                uint32_t mapsize = size;
+                if (mapsize == 0) {                              // 0 => map to EOF
+                    uint64_t end = wg_files_set_pointer_64(fh, 0, 2); // SEEK_END
+                    mapsize = (end > offset) ? (uint32_t)(end - offset) : 0x1000;
+                }
+                if (mapsize > 0x8000000u) mapsize = 0x8000000u;  // 128MB cap per view
+                uint32_t gaddr = wg_guest_alloc_aligned(engine, mapsize, 0x10000);
+                if (gaddr) {
+                    wg_files_set_pointer_64(fh, (int64_t)offset, 0); // SEEK_SET
+                    uint8_t *tmp = malloc(mapsize);
+                    if (tmp) {
+                        uint32_t nread = 0;
+                        wg_files_read(fh, tmp, mapsize, &nread);
+                        if (nread) wg_blink_write_mem(engine->blink, gaddr, tmp, nread);
+                        free(tmp);
+                        ret_val = gaddr;
+                        WG_LOGI(TAG, "MapViewOfFile(map=0x%X off=%llu size=%u) -> 0x%X (read %u)",
+                                hmap, (unsigned long long)offset, mapsize, gaddr, nread);
+                    }
+                }
+            }
+            if (!ret_val) s_last_error = 8;
+        } else if (strcmp(fn, "UnmapViewOfFile") == 0) {
+            // The view's guest memory is left mapped (bump-allocated; harmless). Succeed.
+            ret_val = 1;
         } else if (strcmp(fn, "ReadFile") == 0) {
             uint32_t handle = args[0];
             uint32_t buf_addr = args[1];
@@ -9454,6 +9513,19 @@ void wg_engine_tick(WGEngine *engine) {
         }
         WG_LOGW(TAG, "RIPSAMPLE tick=%llu rip=0x%llX callers: %s",
                 (unsigned long long)engine->tick_count, (unsigned long long)rip, chain);
+        // STRLENPROBE: in the hot chunked string-builder (0x9F4D80-0x9F4F30) rbp is
+        // the FString/buffer; [rbp+0xc]=length, [rbp+8]=chunk index. If length grows
+        // UNBOUNDED across samples => a circular Outer chain / GetPathName cycle
+        // building an infinite path (residual construction corruption); bounded =>
+        // a normal per-object string. Pinpoints the post-swapchain O(N^2) stall.
+        if (getenv("WG_STRLENPROBE") && rip >= 0x9F4D80 && rip <= 0x9F4F30) {
+            uint32_t rbp = (uint32_t)wg_blink_get_reg(engine->blink, 5);
+            uint32_t len = 0, chunks = 0;
+            wg_blink_read_mem(engine->blink, rbp + 0xc, &len, 4);
+            wg_blink_read_mem(engine->blink, rbp + 8, &chunks, 4);
+            WG_LOGW(TAG, "STRLENPROBE rip=0x%llX rbp=0x%X len=%u chunks=%u",
+                    (unsigned long long)rip, rbp, len, chunks);
+        }
         // DRAIN PROBE: when the hot rip is inside the FArchive::Serialize frontier
         // function (~0x815800-0x8158a0), dump the FArchive (RBX) + its buffer write
         // position [RBX+0x90] + base [RBX+0x98] + the source ptr [RBX+0x98]-deref.

@@ -283,7 +283,9 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("KERNEL32.dll", CreatePipe, 4);
     RS("KERNEL32.dll", UnmapViewOfFile, 1);
     RS("KERNEL32.dll", MapViewOfFile, 5);
+    RS("KERNEL32.dll", MapViewOfFileEx, 6);
     RS("KERNEL32.dll", CreateFileMappingW, 6);
+    RS("KERNEL32.dll", CreateFileMappingA, 6);
     RS("KERNEL32.dll", IsWow64Process, 2);
     RS("ADVAPI32.dll", InitializeSecurityDescriptor, 2);
     RS("ADVAPI32.dll", SetSecurityDescriptorDacl, 4);
