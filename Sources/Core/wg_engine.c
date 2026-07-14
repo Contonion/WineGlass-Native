@@ -2890,10 +2890,34 @@ static int wg_guest_vsprintf(WGEngine *e, bool wide, uint32_t buf, uint32_t coun
 // Try to handle `fn` as a CRT function. Returns true (and sets *ret) if handled.
 // Does NOT claim memcpy/memset/memmove/malloc/calloc/free/realloc/_initterm —
 // those have dedicated handlers elsewhere in the dispatch.
-static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_t *ret) {
+static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_t *args64, uint64_t *ret) {
     #define A0 args[0]
     #define A1 args[1]
     #define A2 args[2]
+    // wcsstr — ESSENTIAL for UE4 config init (path `/..` collapse + config token
+    // substitution {ENGINE}/{PROJECT}/{PLATFORM}/{USER}...). Auto-stubbed it never
+    // found anything, so config init looped forever and the boot never reached the
+    // renderer. Uses the FULL 64-bit args (haystacks are short path/config strings).
+    if (!strcmp(fn,"wcsstr")) {
+        uint64_t hay = args64[0], nd = args64[1];
+        uint16_t needle[1024]; wg_read_wstr(engine, nd, needle, 1024);
+        int nlen = 0; while (nlen < 1023 && needle[nlen]) nlen++;
+        if (nlen == 0) { *ret = hay; return true; }
+        const int WIN = 8192; uint16_t win[WIN];
+        uint32_t gpos = 0; const uint32_t MAXSCAN = 8u * 1024 * 1024;
+        while (gpos < MAXSCAN) {
+            wg_blink_read_mem(engine->blink, hay + (uint64_t)gpos * 2, win, WIN * 2);
+            int valid = 0; while (valid < WIN && win[valid]) valid++;
+            int limit = valid - nlen;
+            for (int i = 0; i <= limit; i++) {
+                int j = 0; while (j < nlen && win[i + j] == needle[j]) j++;
+                if (j == nlen) { *ret = hay + (uint64_t)(gpos + i) * 2; return true; }
+            }
+            if (valid < WIN) { *ret = 0; return true; }
+            gpos += WIN - (nlen - 1);
+        }
+        *ret = 0; return true;
+    }
     #define A3 args[3]
 
     // ---- ctype (int in / int out; no guest memory) ----
@@ -3890,6 +3914,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
             WG_LOGE(TAG, "*** MessageBox [%s]: %s", cap, text);
         }
 
+        // DIAG (passive — does NOT handle wcsstr, so it stays auto-stubbed): log the
+        // needle the game keeps searching for in the asset-scan loop, once per unique
+        // needle string, to identify what it's looking for and never finding.
+        if (!strcmp(fn, "wcsstr")) {
+            static uint64_t s_seen_needle[64]; static int s_seen_n = 0;
+            uint64_t ndl = args64[1]; int seen = 0;
+            for (int i = 0; i < s_seen_n; i++) if (s_seen_needle[i] == ndl) { seen = 1; break; }
+            if (!seen && s_seen_n < 64) {
+                s_seen_needle[s_seen_n++] = ndl;
+                uint16_t w[256]; wg_read_wstr(engine, ndl, w, 256);
+                char nb[256]; int i = 0; for (; i < 255 && w[i]; i++) nb[i] = (char)(w[i] < 128 ? w[i] : '?'); nb[i] = 0;
+                uint16_t hw[64]; wg_read_wstr(engine, args64[0], hw, 64);
+                char hb[64]; int k = 0; for (; k < 63 && hw[k]; k++) hb[k] = (char)(hw[k] < 128 ? hw[k] : '?'); hb[k] = 0;
+                WG_LOGW(TAG, "wcsstr needle[%d]=\"%s\"  haystack@0x%llX starts \"%s\"",
+                        s_seen_n, nb, (unsigned long long)args64[0], hb);
+            }
+        }
+
         // DIAG: identify a thunk the MAIN gets stuck spinning on (same fn 5000x in a row).
         if (s_cur_guest_tid == 1) {
             static const char *s_lastfn = 0; static unsigned s_samefn = 0;
@@ -3993,7 +4035,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
 
         if (entry->dll_name && strcasecmp(entry->dll_name, "nsDialogs.dll") == 0) {
             ret_val = handle_nsdialogs(engine, fn, args);
-        } else if (wg_try_crt(engine, fn, args, &ret_val)) {
+        } else if (wg_try_crt(engine, fn, args, args64, &ret_val)) {
             // Handled as a C runtime function (string/memory/ctype/heap/startup).
         } else if (strcmp(fn, "CreateDXGIFactory") == 0 ||
                    strcmp(fn, "CreateDXGIFactory1") == 0 ||
