@@ -159,6 +159,7 @@ static _Thread_local uint32_t s_cur_guest_tid = 1;
 static pthread_mutex_t s_dir_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_dir_c = PTHREAD_COND_INITIALIZER;
 static pthread_t s_dir_owner; static int s_dir_owned = 0, s_dir_rec = 0;
+static volatile uint32_t s_dir_owner_tid = 0;   // guest tid currently holding the GIL
 static uint32_t s_dir_prefer = 0;     // guest tid to hand the GIL to next (0 = free)
 static int      s_dir_stall  = 0;     // consecutive acquire-timeouts blocked by prefer
 static signed char s_dir_on = -1;
@@ -202,6 +203,13 @@ static volatile int s_main_blocked = 0;         // main is in a genuine blocking
 static bool     s_ctor_armed = false;
 static uint8_t  s_ctor_orig  = 0;
 static uint64_t s_ctor_addr  = 0x9E36E0;
+// WG_LOOPPROBE: inline hook on the construction-driver's hash-chain walk body
+// (default 0xB72547 = `mov eax,esi`, 89 F0). Counts chain nodes visited so we can
+// tell a NON-growing/degenerate table (huge nodes-per-construction => O(N) walks =>
+// grow-the-table fix) from pure emulation speed (few nodes => JIT is the answer).
+static bool     s_loop_armed = false;
+static uint8_t  s_loop_orig  = 0;
+static uint64_t s_loop_addr  = 0xA5AC68;
 // Set once the boot is PAST early UObject registration (the corruption window) — the
 // game shows its main window only after engine PreInit/registration. From then on the
 // WG_BLOCK_WORKERS gate stops parking pool workers so the post-init task-graph
@@ -231,6 +239,7 @@ static void dir_lock(void) {
     }
     if (counted) s_gil_waiters--;
     s_dir_owner = pthread_self(); s_dir_owned = 1; s_dir_rec = 1;
+    s_dir_owner_tid = me;   // who holds the GIL (for the deadlock dump)
     if (s_dir_prefer == me) { s_dir_prefer = 0; s_dir_stall = 0; }   // consumed
     pthread_mutex_unlock(&s_dir_m);
 }
@@ -3130,6 +3139,29 @@ static bool handle_blink_thunk(WGEngine *engine) {
         wg_blink_write_mem(engine->blink, (uint32_t)(crsp + 8), &crbx, 8);
         wg_blink_set_rip(engine->blink, (uint32_t)(rip + 5));
         (void)s_ctor_orig;
+        return true;
+    }
+
+    // WG_LOOPPROBE: UObject intrusive list-walk ADVANCE (0xA5AC68 = `mov rbx,[rbx+0x28]`,
+    // rbx = rbx->next). A node whose next points to ITSELF is a single-element circular
+    // list whose terminator was never linked (the render-blocking self-loop the code
+    // comment at dir_lock() describes) — the guest walk `test rbx; jne` never exits and
+    // the boot hangs forever at 0xA5AC30. Fix generically + O(1): if next == current
+    // node, hand back 0 so the guest's own null-check terminates the walk. Emulate the
+    // 4-byte mov and jump +4, keeping the HLT so it re-traps under the JIT.
+    if (s_loop_armed && rip == s_loop_addr) {
+        static unsigned long long s_loop_breaks = 0;
+        uint64_t cur = wg_blink_get_reg(engine->blink, 3);     // rbx = current node
+        uint64_t nxt = 0; wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x28), &nxt, 8);
+        if (nxt == cur && cur != 0) {                          // self-referential node -> break
+            nxt = 0;
+            if ((++s_loop_breaks % 100000ULL) == 1)
+                WG_LOGW(TAG, "WG_LOOPBREAK: terminated self-loop at node 0x%llX (%llu total)",
+                        (unsigned long long)cur, s_loop_breaks);
+        }
+        wg_blink_set_reg(engine->blink, 3, nxt);              // rbx = next (or 0 to break)
+        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 4)); // past the 4-byte mov
+        (void)s_loop_orig;
         return true;
     }
 
@@ -8928,6 +8960,20 @@ static bool load_pe_blink(WGEngine *engine) {
         }
     }
 
+    // WG_LOOPPROBE: arm the construction-driver chain-walk counter (diagnostic only).
+    s_loop_armed = false;
+    if (pe->is_64bit && getenv("WG_LOOPPROBE")) {
+        const char *a = getenv("WG_LOOP_ADDR");
+        s_loop_addr = a ? strtoull(a, 0, 16) : 0xB72547ULL;
+        if (wg_blink_read_mem(engine->blink, s_loop_addr, &s_loop_orig, 1)) {
+            uint8_t hlt = 0xF4;
+            wg_blink_write_mem(engine->blink, s_loop_addr, &hlt, 1);
+            s_loop_armed = true;
+            WG_LOGW(TAG, "WG_LOOPPROBE: armed chain-walk counter @0x%llX (orig=0x%02X)",
+                    (unsigned long long)s_loop_addr, s_loop_orig);
+        }
+    }
+
     // General guest-address trace (WG_TRACE): add wg_trace_add(addr,label) calls
     // here to breakpoint + log register state at guest addresses. Kept as a
     // reusable diagnostic; no addresses armed by default.
@@ -9305,6 +9351,12 @@ static void *wg_deadlock_watchdog(void *arg) {
         if (delta < 3000 || dmain == 0) {
             low += 3;
             if (low >= secs) {
+                // Always reprint the MAIN/GIL line so ripStall/tick can be watched over
+                // time (climbing ripStall + frozen tick = the main is spinning one spot).
+                fprintf(stderr, "[watchdog] MAIN: rip=0x%llX ripStall=%u tick=%llu blocked=%d | GIL: owned=%d owner_tid=0x%X prefer=0x%X waiters=%d rec=%d\n",
+                        (unsigned long long)s_main_rip_pub, s_main_rip_stall,
+                        (unsigned long long)s_main_tick_pub, s_main_blocked,
+                        s_dir_owned, s_dir_owner_tid, s_dir_prefer, s_gil_waiters, s_dir_rec);
                 if (!dumped) {
                     fprintf(stderr, "\n[watchdog] near-zero progress (%llu thunks/3s) ~%ds — DEADLOCK; live waits:\n", delta, low);
                     wg_sync_dump_waits();
