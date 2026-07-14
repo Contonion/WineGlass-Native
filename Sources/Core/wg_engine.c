@@ -213,9 +213,12 @@ static uint64_t s_ctor_addr  = 0x9E36E0;
 // 0x6FB9A4. A single self-referential node (next==self, terminator never linked)
 // hangs ALL of them. Arm each; on a genuinely stuck self-loop, PATCH the node's
 // memory ([node+0x28]=0) so every other walk site is fixed too — not just this one.
-static struct { uint64_t addr; uint8_t orig; bool armed; } s_loops[] = {
-    { 0xA5AC68, 0, false },   // ProcessNewlyLoadedUObjects list-walk advance
-    { 0x6FB9A4, 0, false },   // FUObjectHashTables bucket-chain iterator advance
+// {addr, reg, off}: a `mov <reg>,[<reg>+off]` intrusive-list advance. reg is a blink
+// register index (rbx=3, rax=0). A node whose [reg+off]==self hangs the walk forever.
+static struct { uint64_t addr; uint8_t reg; uint8_t off; uint8_t orig; bool armed; } s_loops[] = {
+    { 0xA5AC68, 3, 0x28, 0, false },   // ProcessNewlyLoadedUObjects: mov rbx,[rbx+0x28]
+    { 0x6FB9A4, 3, 0x28, 0, false },   // FUObjectHashTables iterator: mov rbx,[rbx+0x28]
+    { 0xB7BD93, 0, 0x20, 0, false },   // outer-chain walk (error path): mov rax,[rax+0x20]
 };
 #define WG_NLOOPS ((int)(sizeof(s_loops)/sizeof(s_loops[0])))
 static bool     s_loop_armed = false;
@@ -3287,22 +3290,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
             static uint64_t s_loop_last = 0; static unsigned long long s_loop_same = 0;
             static unsigned long long s_loop_breaks = 0;
             const unsigned long long BREAK_AFTER = 200000ULL;
-            uint64_t cur = wg_blink_get_reg(engine->blink, 3);     // rbx = current node
-            uint64_t nxt = 0; wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x28), &nxt, 8);
+            uint8_t rg = s_loops[li].reg, of = s_loops[li].off;
+            uint64_t cur = wg_blink_get_reg(engine->blink, rg);   // current node
+            uint64_t nxt = 0; wg_blink_read_mem(engine->blink, (uint32_t)(cur + of), &nxt, 8);
             if (nxt == cur && cur != 0 && cur == s_loop_last) s_loop_same++;
             else { s_loop_same = 0; s_loop_last = cur; }
             if (s_loop_same > BREAK_AFTER) {                       // genuinely stuck self-loop
                 // Patch the node in guest memory so EVERY walk site (this one, the hash
                 // iterator, ...) sees a terminated chain — not just this register.
                 uint64_t zero = 0;
-                wg_blink_write_mem(engine->blink, (uint32_t)(cur + 0x28), &zero, 8);
+                wg_blink_write_mem(engine->blink, (uint32_t)(cur + of), &zero, 8);
                 nxt = 0;
                 s_loop_same = 0;
                 if ((++s_loop_breaks % 1000ULL) == 1)
                     WG_LOGW(TAG, "WG_LOOPBREAK: patched stuck self-loop node 0x%llX @site 0x%llX (%llu total)",
                             (unsigned long long)cur, (unsigned long long)rip, s_loop_breaks);
             }
-            wg_blink_set_reg(engine->blink, 3, nxt);              // rbx = next (or 0 to break)
+            wg_blink_set_reg(engine->blink, rg, nxt);            // reg = next (or 0 to break)
             wg_blink_set_rip(engine->blink, (uint32_t)(rip + 4)); // past the 4-byte mov
             (void)s_loop_orig;
             return true;
@@ -10591,6 +10595,33 @@ void wg_engine_tick(WGEngine *engine) {
                                 break;
                         }
                     }
+                    // WG_ABORT_CONTINUE: limp past a real memory fault too (same as the
+                    // WG_BLINK_ERROR path) — unwind the faulting function (pop return addr,
+                    // null result) so the boot keeps going past a non-critical crash toward
+                    // a rendered frame. Bounded so a genuine crash-storm still stops.
+                    if (getenv("WG_ABORT_CONTINUE")) {
+                        static int s_limpsv = 0;
+                        uint64_t img_lo = engine->pe_image ? engine->pe_image->image_base + 0x1000 : 0x401000;
+                        uint64_t img_hi = engine->pe_image ? engine->pe_image->image_base + engine->pe_image->size_of_image : 0x8C0000;
+                        if (s_limpsv < 100000) {
+                            uint64_t rsp = wg_blink_get_reg(engine->blink, 4);
+                            uint64_t ret = 0; wg_blink_read_mem(engine->blink, rsp, &ret, 8);
+                            if (ret >= img_lo && ret < img_hi) {
+                                if ((s_limpsv++ % 1000) == 0)
+                                    WG_LOGW(TAG, "WG_ABORT_CONTINUE(sv): unwind fault #%d @0x%llx -> ret 0x%llx",
+                                            s_limpsv, (unsigned long long)halt_rip, (unsigned long long)ret);
+                                wg_blink_set_reg(engine->blink, 0, 0);
+                                wg_blink_set_reg(engine->blink, 4, rsp + 8);
+                                wg_blink_set_rip(engine->blink, ret);
+                                break;
+                            }
+                            if ((s_limpsv++ % 1000) == 0)
+                                WG_LOGW(TAG, "WG_ABORT_CONTINUE(sv): skip fault #%d @0x%llx (no ret)",
+                                        s_limpsv, (unsigned long long)halt_rip);
+                            wg_blink_set_rip(engine->blink, halt_rip + 1);
+                            break;
+                        }
+                    }
                     WG_LOGE(TAG, "Crash at RIP=0x%llx (SIGSEGV — bad pointer or unmapped memory)",
                             (unsigned long long)halt_rip);
                     // Dump registers for debugging
@@ -10688,11 +10719,30 @@ void wg_engine_tick(WGEngine *engine) {
                 if (getenv("WG_ABORT_CONTINUE")) {
                     static int s_limp = 0;
                     uint64_t crip = wg_blink_get_rip(engine->blink);
-                    if (s_limp < 20000) {
-                        if ((s_limp++ % 500) == 0)
-                            WG_LOGW(TAG, "WG_ABORT_CONTINUE: limping past crash #%d @RIP=0x%llx",
+                    uint64_t img_lo = engine->pe_image ? engine->pe_image->image_base + 0x1000 : 0x401000;
+                    uint64_t img_hi = engine->pe_image ? engine->pe_image->image_base + engine->pe_image->size_of_image : 0x8C0000;
+                    if (s_limp < 100000) {
+                        // RETURN from the faulting function instead of skipping a byte: pop
+                        // the return address off the stack and continue at the caller with a
+                        // null result (rax=0). The crash is in the fatal's error-message
+                        // builder (an outer-chain walk over corrupt data); unwinding it lets
+                        // the boot keep going past a non-critical missing-asset fatal.
+                        uint64_t rsp = wg_blink_get_reg(engine->blink, 4);
+                        uint64_t ret = 0; wg_blink_read_mem(engine->blink, rsp, &ret, 8);
+                        if (ret >= img_lo && ret < img_hi) {
+                            if ((s_limp++ % 1000) == 0)
+                                WG_LOGW(TAG, "WG_ABORT_CONTINUE: unwinding crash #%d @0x%llx -> ret 0x%llx",
+                                        s_limp, (unsigned long long)crip, (unsigned long long)ret);
+                            wg_blink_set_reg(engine->blink, 0, 0);          // rax = 0 (null result)
+                            wg_blink_set_reg(engine->blink, 4, rsp + 8);    // pop return addr
+                            wg_blink_set_rip(engine->blink, ret);
+                            break;
+                        }
+                        // No valid return addr on the stack — skip the faulting byte instead.
+                        if ((s_limp++ % 1000) == 0)
+                            WG_LOGW(TAG, "WG_ABORT_CONTINUE: skip crash #%d @0x%llx (no ret)",
                                     s_limp, (unsigned long long)crip);
-                        wg_blink_set_rip(engine->blink, crip + 1);   // skip faulting byte, retry decode
+                        wg_blink_set_rip(engine->blink, crip + 1);
                         break;
                     }
                 }
