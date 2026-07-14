@@ -6119,6 +6119,27 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "memcpy") == 0 || strcmp(fn, "memmove") == 0) {
             // mem(c)py(dest, src, n) -> returns dest. Use args64 for the pointers.
             uint64_t dst = args64[0], src = args64[1], n = args64[2];
+            // DIAG: catch a write INTO the rebased PE image code (0x400000..~.text end).
+            // The config-init crash writes a config string to a pointer-into-image
+            // (0x684FA0) then reallocs it -> FMallocBinned2 fatal. Log the guest caller
+            // so it can be disassembled to see how that bad pointer was produced.
+            static signed char s_imgwrite = -1;
+            if (s_imgwrite < 0) s_imgwrite = getenv("WG_IMGWRITE") ? 1 : 0;
+            if (s_imgwrite && dst >= 0x401000 && dst < 0x2758000) {
+                WG_LOGW(TAG, "IMGWRITE %s dst=0x%llX(.text) src=0x%llX n=%llu caller=0x%llX",
+                        fn, (unsigned long long)dst, (unsigned long long)src,
+                        (unsigned long long)n, (unsigned long long)ret_addr);
+                // Walk the guest stack for return addresses in .text to find the
+                // game logic that produced the bad dst pointer.
+                uint64_t rsp = wg_blink_get_reg(engine->blink, 4);
+                char chain[256]; int ci = 0;
+                for (int off = 0; off <= 0x80 && ci < 200; off += 8) {
+                    uint64_t v = 0; wg_blink_read_mem(engine->blink, rsp + off, &v, 8);
+                    if (v >= 0x401000 && v < 0x2758000)
+                        ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%llX ", (unsigned long long)v);
+                }
+                WG_LOGW(TAG, "IMGWRITE stack .text chain: %s", chain);
+            }
             if (dst && src && n && n <= 64u * 1024 * 1024) {
                 // Fast direct guest->guest copy (no malloc) — default ON (see memset).
                 static signed char s_fastmem = -1;
