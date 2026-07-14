@@ -24,6 +24,7 @@ extern int WGBlinkVM_Step(WGBlinkVM *vm);
 extern int WGBlinkVM_Run(WGBlinkVM *vm, int max_insns);
 extern unsigned long long WGBlinkVM_GetReg(WGBlinkVM *vm, int idx);
 extern void WGBlinkVM_SetReg(WGBlinkVM *vm, int idx, unsigned long long val);
+extern void WGBlinkVM_SetXmmLow(WGBlinkVM *vm, int idx, unsigned long long lo);
 extern unsigned long long WGBlinkVM_GetRIP(WGBlinkVM *vm);
 extern void WGBlinkVM_SetRIP(WGBlinkVM *vm, unsigned long long rip);
 extern int WGBlinkVM_WriteMem(WGBlinkVM *vm, unsigned long long addr,
@@ -218,6 +219,11 @@ uint64_t wg_blink_get_reg(WGBlinkInstance *inst, int reg_index) {
 void wg_blink_set_reg(WGBlinkInstance *inst, int reg_index, uint64_t val) {
     if (!inst || !inst->vm) return;
     WGBlinkVM_SetReg(inst->vm, reg_index, val);
+}
+
+void wg_blink_set_xmm_low(WGBlinkInstance *inst, int idx, uint64_t lo) {
+    if (!inst || !inst->vm) return;
+    WGBlinkVM_SetXmmLow(inst->vm, idx, lo);
 }
 
 uint64_t wg_blink_get_rip(WGBlinkInstance *inst) {

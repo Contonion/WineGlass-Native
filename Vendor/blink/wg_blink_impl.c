@@ -431,6 +431,17 @@ void WGBlinkVM_SetReg(struct WGBlinkVM *vm, int idx, unsigned long long val) {
     Put64(cur_m(vm)->weg[idx], val);
 }
 
+// Set the low 64 bits of an XMM register (little-endian byte order). Needed to
+// return doubles/floats from thunk handlers per the SysV/Win64 ABI (FP return
+// in XMM0) — e.g. wcstod/atof, which UE4's JSON reader uses to parse numeric
+// fields. Without this, those functions auto-stub to 0 and every JSON number
+// (incl. the .uproject "FileVersion") reads as 0.
+void WGBlinkVM_SetXmmLow(struct WGBlinkVM *vm, int idx, unsigned long long lo) {
+    if (!vm || idx < 0 || idx >= 16) return;
+    unsigned char *x = cur_m(vm)->xmm[idx];
+    for (int i = 0; i < 8; i++) x[i] = (unsigned char)(lo >> (i * 8));
+}
+
 unsigned long long WGBlinkVM_GetRIP(struct WGBlinkVM *vm) {
     return vm ? cur_m(vm)->ip : 0;
 }

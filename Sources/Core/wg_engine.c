@@ -2931,10 +2931,60 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
     }
 
     // ---- conversion ----
-    if (!strcmp(fn,"atoi")||!strcmp(fn,"_wtoi")) { char s[64]; wg_read_cstr(engine,A0,s,sizeof s); *ret=(uint32_t)(int32_t)atoi(s); return true; }
+    // Helper: pull a wide arg into a narrow ASCII buffer (number parsing only
+    // ever sees ASCII: digits, sign, '.', 'e'). Reading a wide string with
+    // wg_read_cstr is WRONG — UTF-16 "12" is 31 00 32 00, so the narrow read
+    // stops after the first digit. Read it as wide and down-convert.
+    #define WG_WIDE_TO_ASCII(dstbuf) do { \
+        uint16_t _w[256]; wg_read_wstr(engine, A0, _w, 256); \
+        int _i = 0; for (; _i < (int)sizeof(dstbuf) - 1 && _w[_i]; _i++) \
+            (dstbuf)[_i] = (_w[_i] < 128) ? (char)_w[_i] : '?'; \
+        (dstbuf)[_i] = 0; } while (0)
+    bool is64 = engine->pe_image && engine->pe_image->is_64bit;
+    if (!strcmp(fn,"atoi")) { char s[64]; wg_read_cstr(engine,A0,s,sizeof s); *ret=(uint32_t)(int32_t)atoi(s); return true; }
+    if (!strcmp(fn,"_wtoi")) { char s[64]; WG_WIDE_TO_ASCII(s); *ret=(uint32_t)(int32_t)atoi(s); return true; }
     if (!strcmp(fn,"atol")) { char s[64]; wg_read_cstr(engine,A0,s,sizeof s); *ret=(uint32_t)(int32_t)atol(s); return true; }
-    if (!strcmp(fn,"strtol")) { char s[128]; wg_read_cstr(engine,A0,s,sizeof s); char *end; long v=strtol(s,&end,(int)A2); if(A1)wg_blink_write_mem(engine->blink,A1,(uint32_t[]){A0+(uint32_t)(end-s)},4); *ret=(uint32_t)v; return true; }
-    if (!strcmp(fn,"strtoul")) { char s[128]; wg_read_cstr(engine,A0,s,sizeof s); char *end; unsigned long v=strtoul(s,&end,(int)A2); if(A1)wg_blink_write_mem(engine->blink,A1,(uint32_t[]){A0+(uint32_t)(end-s)},4); *ret=(uint32_t)v; return true; }
+    if (!strcmp(fn,"_wtol")) { char s[64]; WG_WIDE_TO_ASCII(s); *ret=(uint32_t)(int32_t)atol(s); return true; }
+    if (!strcmp(fn,"_atoi64")||!strcmp(fn,"_strtoi64")) { char s[64]; wg_read_cstr(engine,A0,s,sizeof s); *ret=(uint64_t)strtoll(s,NULL,10); return true; }
+    if (!strcmp(fn,"_wtoi64")||!strcmp(fn,"_wcstoi64")) { char s[64]; WG_WIDE_TO_ASCII(s); *ret=(uint64_t)strtoll(s,NULL,10); return true; }
+    if (!strcmp(fn,"strtol")) { char s[128]; wg_read_cstr(engine,A0,s,sizeof s); char *end; long v=strtol(s,&end,(int)A2); if(A1){uint64_t ep=(uint64_t)A0+(uint32_t)(end-s); wg_blink_write_mem(engine->blink,A1,&ep,is64?8:4);} *ret=(uint32_t)v; return true; }
+    if (!strcmp(fn,"strtoul")) { char s[128]; wg_read_cstr(engine,A0,s,sizeof s); char *end; unsigned long v=strtoul(s,&end,(int)A2); if(A1){uint64_t ep=(uint64_t)A0+(uint32_t)(end-s); wg_blink_write_mem(engine->blink,A1,&ep,is64?8:4);} *ret=(uint32_t)v; return true; }
+    if (!strcmp(fn,"wcstol")||!strcmp(fn,"wcstoul")||!strcmp(fn,"wcstoll")||!strcmp(fn,"wcstoull")) {
+        char s[128]; WG_WIDE_TO_ASCII(s); char *end;
+        long long v = (fn[5]=='u') ? (long long)strtoull(s,&end,(int)A2) : strtoll(s,&end,(int)A2);
+        if(A1){ uint64_t ep=(uint64_t)A0+(uint64_t)(end-s)*2; wg_blink_write_mem(engine->blink,A1,&ep,is64?8:4); }
+        *ret=(uint64_t)v; return true;
+    }
+    // Floating-point conversions — result returns in XMM0 per the ABI, so use
+    // wg_blink_set_xmm_low. UE4's JSON reader parses every numeric field (incl.
+    // the .uproject "FileVersion") via FCString::Atod -> wcstod; auto-stubbing
+    // it to 0 made every JSON number read as 0 and the game exit(1) with
+    // "File appears to be in a newer version (0) ... (max version: 3)".
+    if (!strcmp(fn,"wcstod")||!strcmp(fn,"_wtof")||!strcmp(fn,"_wcstod_l")) {
+        char s[256]; WG_WIDE_TO_ASCII(s); char *end=s; double d=strtod(s,&end);
+        if(A1 && strcmp(fn,"_wtof")){ uint64_t ep=(uint64_t)A0+(uint64_t)(end-s)*2; wg_blink_write_mem(engine->blink,A1,&ep,is64?8:4); }
+        uint64_t bits; memcpy(&bits,&d,8); wg_blink_set_xmm_low(engine->blink,0,bits);
+        *ret=(uint64_t)(int64_t)d; return true;
+    }
+    if (!strcmp(fn,"atof")||!strcmp(fn,"strtod")||!strcmp(fn,"_atof_l")) {
+        char s[256]; wg_read_cstr(engine,A0,s,sizeof s); char *end=s; double d=strtod(s,&end);
+        if(!strcmp(fn,"strtod") && A1){ uint64_t ep=(uint64_t)A0+(uint64_t)(end-s); wg_blink_write_mem(engine->blink,A1,&ep,is64?8:4); }
+        uint64_t bits; memcpy(&bits,&d,8); wg_blink_set_xmm_low(engine->blink,0,bits);
+        *ret=(uint64_t)(int64_t)d; return true;
+    }
+    if (!strcmp(fn,"wcstof")) {  // returns float (low 32 bits of XMM0)
+        char s[256]; WG_WIDE_TO_ASCII(s); char *end=s; float f=strtof(s,&end);
+        if(A1){ uint64_t ep=(uint64_t)A0+(uint64_t)(end-s)*2; wg_blink_write_mem(engine->blink,A1,&ep,is64?8:4); }
+        uint32_t bits; memcpy(&bits,&f,4); wg_blink_set_xmm_low(engine->blink,0,(uint64_t)bits);
+        *ret=(uint64_t)(int64_t)f; return true;
+    }
+    if (!strcmp(fn,"strtof")) {  // narrow float
+        char s[256]; wg_read_cstr(engine,A0,s,sizeof s); char *end=s; float f=strtof(s,&end);
+        if(A1){ uint64_t ep=(uint64_t)A0+(uint64_t)(end-s); wg_blink_write_mem(engine->blink,A1,&ep,is64?8:4); }
+        uint32_t bits; memcpy(&bits,&f,4); wg_blink_set_xmm_low(engine->blink,0,(uint64_t)bits);
+        *ret=(uint64_t)(int64_t)f; return true;
+    }
+    #undef WG_WIDE_TO_ASCII
 
     // ---- heap extras (base malloc/calloc/free/realloc handled elsewhere) ----
     if (!strcmp(fn,"_aligned_malloc")) { uint32_t g=wg_guest_alloc(engine,A0); *ret=g; return true; } // page-aligned already
@@ -3708,6 +3758,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // Handle specific Win32 functions that affect visual output
     if (entry) {
         const char *fn = entry->func_name;
+
+        // Capture MessageBox text — UE4's fatal-error path pops a MessageBox
+        // ("Assertion failed", "Fatal error", missing-content, etc.) right
+        // before exit(1). We need the message to know WHY the game bails.
+        if (!strcmp(fn, "MessageBoxW") || !strcmp(fn, "MessageBoxA")) {
+            char text[2048] = {0}, cap[512] = {0};
+            if (fn[10] == 'W') {  // MessageBoxW
+                uint16_t wt[2048], wc[512];
+                wg_read_wstr(engine, (uint32_t)args64[1], wt, 2048);
+                wg_read_wstr(engine, (uint32_t)args64[2], wc, 512);
+                for (int i = 0; i < 2047 && wt[i]; i++) text[i] = (char)(wt[i] < 128 ? wt[i] : '?');
+                for (int i = 0; i < 511  && wc[i]; i++) cap[i]  = (char)(wc[i] < 128 ? wc[i] : '?');
+            } else {
+                wg_read_cstr(engine, (uint32_t)args64[1], text, sizeof text);
+                wg_read_cstr(engine, (uint32_t)args64[2], cap, sizeof cap);
+            }
+            WG_LOGE(TAG, "*** MessageBox [%s]: %s", cap, text);
+        }
 
         // DIAG: identify a thunk the MAIN gets stuck spinning on (same fn 5000x in a row).
         if (s_cur_guest_tid == 1) {
@@ -7533,10 +7601,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 1;
         } else if (strcmp(fn, "ReadFile") == 0) {
             uint32_t handle = args[0];
-            uint32_t buf_addr = args[1];
-            uint32_t nbytes = args[2];
-            uint32_t bytes_read_addr = args[3];
-            uint32_t overlapped_addr = args[4];
+            // Buffer/out pointers MUST be the full 64-bit register values: the
+            // 64-bit game reads level/streaming assets into region-3 buffers
+            // (>4GB). Truncating buf_addr to 32-bit (args[1]) landed the data at
+            // a wrong low address, leaving the real buffer garbage -> corrupt
+            // object tables -> crash in the level-load hash walk (0x8f29c4).
+            // args64[i] == args[i] for 32-bit guests, so this is universally safe.
+            uint64_t buf_addr = args64[1];
+            uint32_t nbytes = (uint32_t)args64[2];
+            uint64_t bytes_read_addr = args64[3];
+            uint64_t overlapped_addr = args64[4];
             // Cap per-read to bound the temp malloc, but 1MB was TOO SMALL: the SM5
             // global shader cache is ~5.7MB and UE4 reads it in one call — truncating
             // to 1MB dropped every shader past the first ~1MB, so the game reported
@@ -7597,9 +7671,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
 #endif
         } else if (strcmp(fn, "WriteFile") == 0) {
             uint32_t handle = args[0];
-            uint32_t buf_addr = args[1];
-            uint32_t nbytes = args[2];
-            uint32_t bytes_written_addr = args[3];
+            // Full 64-bit pointers (see ReadFile): buffers may live in region-3
+            // (>4GB). args64[i] == args[i] for 32-bit guests.
+            uint64_t buf_addr = args64[1];
+            uint32_t nbytes = (uint32_t)args64[2];
+            uint64_t bytes_written_addr = args64[3];
             // NOTE: do NOT truncate nbytes here. A previous 1MB cap silently
             // dropped the tail of large writes; Steam's package save requires
             // WriteFile to report the FULL requested count written (it compares
@@ -10720,6 +10796,26 @@ void wg_engine_tick(WGEngine *engine) {
                     }
                     WG_LOGE(TAG, "Crash at RIP=0x%llx (SIGSEGV — bad pointer or unmapped memory)",
                             (unsigned long long)halt_rip);
+                    // 64-bit register dump — the level-load crash (0x8f29c4) walks a
+                    // hash table via rdi=[rsi+0x460]+idx*32; a truncated region-3
+                    // (>4GB) pointer shows here as a low/garbage table base.
+                    {
+                        uint64_t r64[16];
+                        for (int i = 0; i < 16; i++) r64[i] = wg_blink_get_reg(engine->blink, i);
+                        WG_LOGE(TAG, "  RAX=%016llx RCX=%016llx RDX=%016llx RBX=%016llx",
+                            (unsigned long long)r64[0],(unsigned long long)r64[1],
+                            (unsigned long long)r64[2],(unsigned long long)r64[3]);
+                        WG_LOGE(TAG, "  RSP=%016llx RBP=%016llx RSI=%016llx RDI=%016llx",
+                            (unsigned long long)r64[4],(unsigned long long)r64[5],
+                            (unsigned long long)r64[6],(unsigned long long)r64[7]);
+                        WG_LOGE(TAG, "  R8 =%016llx R9 =%016llx R10=%016llx R11=%016llx",
+                            (unsigned long long)r64[8],(unsigned long long)r64[9],
+                            (unsigned long long)r64[10],(unsigned long long)r64[11]);
+                        uint64_t rsi = r64[6], tbl = 0;
+                        wg_blink_read_mem(engine->blink, rsi + 0x460, &tbl, 8);
+                        WG_LOGE(TAG, "  [RSI+0x460](table base)=%016llx  [RSI+0x18](mask)=?",
+                            (unsigned long long)tbl);
+                    }
                     // Dump registers for debugging
                     WG_LOGE(TAG, "  EAX=%08X ECX=%08X EDX=%08X EBX=%08X",
                         (uint32_t)wg_blink_get_reg(engine->blink, 0),

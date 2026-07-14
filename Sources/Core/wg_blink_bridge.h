@@ -37,6 +37,8 @@ WGBlinkResult wg_blink_step(WGBlinkInstance *inst);
 // Register access
 uint64_t wg_blink_get_reg(WGBlinkInstance *inst, int reg_index);
 void     wg_blink_set_reg(WGBlinkInstance *inst, int reg_index, uint64_t val);
+// Set low 64 bits of an XMM register (idx 0..15) — for FP return values (XMM0).
+void     wg_blink_set_xmm_low(WGBlinkInstance *inst, int idx, uint64_t lo);
 uint64_t wg_blink_get_rip(WGBlinkInstance *inst);
 void     wg_blink_set_rip(WGBlinkInstance *inst, uint64_t rip);
 
