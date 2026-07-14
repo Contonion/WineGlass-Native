@@ -207,6 +207,17 @@ static uint64_t s_ctor_addr  = 0x9E36E0;
 // (default 0xB72547 = `mov eax,esi`, 89 F0). Counts chain nodes visited so we can
 // tell a NON-growing/degenerate table (huge nodes-per-construction => O(N) walks =>
 // grow-the-table fix) from pure emulation speed (few nodes => JIT is the answer).
+// Multiple guest sites walk the SAME UObject +0x28 intrusive "next" chain with the
+// identical instruction `mov rbx,[rbx+0x28]` (48 8B 5B 28): the ProcessNewlyLoaded
+// walk at 0xA5AC68 and the FUObjectHashTables bucket iterator inside 0x6fb950 at
+// 0x6FB9A4. A single self-referential node (next==self, terminator never linked)
+// hangs ALL of them. Arm each; on a genuinely stuck self-loop, PATCH the node's
+// memory ([node+0x28]=0) so every other walk site is fixed too — not just this one.
+static struct { uint64_t addr; uint8_t orig; bool armed; } s_loops[] = {
+    { 0xA5AC68, 0, false },   // ProcessNewlyLoadedUObjects list-walk advance
+    { 0x6FB9A4, 0, false },   // FUObjectHashTables bucket-chain iterator advance
+};
+#define WG_NLOOPS ((int)(sizeof(s_loops)/sizeof(s_loops[0])))
 static bool     s_loop_armed = false;
 static uint8_t  s_loop_orig  = 0;
 static uint64_t s_loop_addr  = 0xA5AC68;
@@ -3149,31 +3160,38 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // the boot hangs forever at 0xA5AC30. Fix generically + O(1): if next == current
     // node, hand back 0 so the guest's own null-check terminates the walk. Emulate the
     // 4-byte mov and jump +4, keeping the HLT so it re-traps under the JIT.
-    if (s_loop_armed && rip == s_loop_addr) {
-        // CAUTION: a node whose next==self is only a BUG if the walk is genuinely stuck
-        // there forever. During construction a node is *transiently* self-referential
-        // (its terminator not yet linked) — nulling that would corrupt the half-built
-        // list and crash the hash insert (0xb72582). So only break after the SAME self-
-        // node has been re-walked many CONSECUTIVE times (a real infinite loop); a
-        // transient self-ref advances (next!=cur, or cur changes) and resets the count.
-        static uint64_t s_loop_last = 0; static unsigned long long s_loop_same = 0;
-        static unsigned long long s_loop_breaks = 0;
-        const unsigned long long BREAK_AFTER = 200000ULL;
-        uint64_t cur = wg_blink_get_reg(engine->blink, 3);     // rbx = current node
-        uint64_t nxt = 0; wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x28), &nxt, 8);
-        if (nxt == cur && cur != 0 && cur == s_loop_last) s_loop_same++;
-        else { s_loop_same = 0; s_loop_last = cur; }
-        if (s_loop_same > BREAK_AFTER) {                       // genuinely stuck self-loop
-            nxt = 0;
-            s_loop_same = 0;
-            if ((++s_loop_breaks % 1000ULL) == 1)
-                WG_LOGW(TAG, "WG_LOOPBREAK: terminated stuck self-loop at node 0x%llX (%llu total)",
-                        (unsigned long long)cur, s_loop_breaks);
+    if (s_loop_armed) {
+        for (int li = 0; li < WG_NLOOPS; li++) {
+            if (!s_loops[li].armed || rip != s_loops[li].addr) continue;
+            // CAUTION: a node whose next==self is only a BUG if the walk is genuinely
+            // stuck there forever. During construction a node is *transiently* self-
+            // referential (terminator not yet linked) — nulling that would corrupt the
+            // half-built list and crash the hash insert (0xb72582). So only break after
+            // the SAME self-node is re-walked many CONSECUTIVE times (a real infinite
+            // loop); a transient self-ref advances (next!=cur, or cur changes) & resets.
+            static uint64_t s_loop_last = 0; static unsigned long long s_loop_same = 0;
+            static unsigned long long s_loop_breaks = 0;
+            const unsigned long long BREAK_AFTER = 200000ULL;
+            uint64_t cur = wg_blink_get_reg(engine->blink, 3);     // rbx = current node
+            uint64_t nxt = 0; wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x28), &nxt, 8);
+            if (nxt == cur && cur != 0 && cur == s_loop_last) s_loop_same++;
+            else { s_loop_same = 0; s_loop_last = cur; }
+            if (s_loop_same > BREAK_AFTER) {                       // genuinely stuck self-loop
+                // Patch the node in guest memory so EVERY walk site (this one, the hash
+                // iterator, ...) sees a terminated chain — not just this register.
+                uint64_t zero = 0;
+                wg_blink_write_mem(engine->blink, (uint32_t)(cur + 0x28), &zero, 8);
+                nxt = 0;
+                s_loop_same = 0;
+                if ((++s_loop_breaks % 1000ULL) == 1)
+                    WG_LOGW(TAG, "WG_LOOPBREAK: patched stuck self-loop node 0x%llX @site 0x%llX (%llu total)",
+                            (unsigned long long)cur, (unsigned long long)rip, s_loop_breaks);
+            }
+            wg_blink_set_reg(engine->blink, 3, nxt);              // rbx = next (or 0 to break)
+            wg_blink_set_rip(engine->blink, (uint32_t)(rip + 4)); // past the 4-byte mov
+            (void)s_loop_orig;
+            return true;
         }
-        wg_blink_set_reg(engine->blink, 3, nxt);              // rbx = next (or 0 to break)
-        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 4)); // past the 4-byte mov
-        (void)s_loop_orig;
-        return true;
     }
 
     // Real-threads: handle the FUNCTIONAL cipher-list max_ver trap here (not just
@@ -8971,17 +8989,20 @@ static bool load_pe_blink(WGEngine *engine) {
         }
     }
 
-    // WG_LOOPPROBE: arm the construction-driver chain-walk counter (diagnostic only).
+    // WG_LOOPPROBE: arm the self-loop breakers at every UObject +0x28 chain-walk site.
     s_loop_armed = false;
     if (pe->is_64bit && getenv("WG_LOOPPROBE")) {
         const char *a = getenv("WG_LOOP_ADDR");
-        s_loop_addr = a ? strtoull(a, 0, 16) : 0xA5AC68ULL;   // UObject list-walk advance
-        if (wg_blink_read_mem(engine->blink, s_loop_addr, &s_loop_orig, 1)) {
-            uint8_t hlt = 0xF4;
-            wg_blink_write_mem(engine->blink, s_loop_addr, &hlt, 1);
-            s_loop_armed = true;
-            WG_LOGW(TAG, "WG_LOOPPROBE: armed chain-walk counter @0x%llX (orig=0x%02X)",
-                    (unsigned long long)s_loop_addr, s_loop_orig);
+        if (a) { s_loops[0].addr = strtoull(a, 0, 16); }   // override the primary site
+        for (int li = 0; li < WG_NLOOPS; li++) {
+            if (wg_blink_read_mem(engine->blink, s_loops[li].addr, &s_loops[li].orig, 1)) {
+                uint8_t hlt = 0xF4;
+                wg_blink_write_mem(engine->blink, s_loops[li].addr, &hlt, 1);
+                s_loops[li].armed = true;
+                s_loop_armed = true;
+                WG_LOGW(TAG, "WG_LOOPPROBE: armed self-loop breaker @0x%llX (orig=0x%02X)",
+                        (unsigned long long)s_loops[li].addr, s_loops[li].orig);
+            }
         }
     }
 
