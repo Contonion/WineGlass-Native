@@ -1694,6 +1694,58 @@ static void track_alloc(uint32_t addr, uint32_t size) {
     }
 }
 
+// Look up a tracked allocation's size by base address (most-recent first).
+static uint32_t alloc_size_for(uint32_t addr) {
+    for (int i = s_alloc_count - 1; i >= 0; i--)
+        if (s_alloc_sizes[i].addr == addr) return s_alloc_sizes[i].size;
+    return 0;
+}
+
+// Free list so VirtualFree/HeapFree actually RECLAIM memory. WineGlass's guest heap was
+// a pure bump allocator that never freed, so the game's normal alloc/free churn (e.g. the
+// UE4 asset buffer-grow: alloc bigger, memcpy, free old — repeated with climbing sizes)
+// leaked the whole ~2.75GB 32-bit heap and OOM-fatal'd right before the UI renders. Path
+// B caps the guest VA at 4GB so we can't just hand out a huge 64-bit heap; instead, put
+// freed blocks back and reuse them.
+#define WG_MAX_FREE 8192
+static struct { uint32_t addr; uint32_t size; } s_free_blocks[WG_MAX_FREE];
+static int s_free_count = 0;
+
+static void wg_guest_free(uint32_t addr, uint32_t size) {
+    if (!addr) return;
+    if (!size) size = alloc_size_for(addr);
+    if (!size) return;                       // unknown block — can't safely reclaim
+    size = (size + 0xFFFu) & ~0xFFFu;
+    if (s_free_count < WG_MAX_FREE) {
+        s_free_blocks[s_free_count].addr = addr;
+        s_free_blocks[s_free_count].size = size;
+        s_free_count++;
+    }
+}
+
+// First-fit reuse of a freed block for a new allocation (splitting a larger one). Returns
+// 0 if nothing fits. The returned region is already mapped in blink from its prior life.
+static uint32_t wg_free_list_take(uint32_t alloc) {
+    // Round the take up to 64KB so a split leaves the remainder 64KB-aligned too — the
+    // free blocks all start 64KB-aligned (VirtualAlloc granularity) and VirtualAlloc's
+    // reuse depends on that alignment for FMallocBinned2's pool math.
+    uint32_t take = (alloc + 0xFFFFu) & ~0xFFFFu;
+    for (int i = 0; i < s_free_count; i++) {
+        if (s_free_blocks[i].size >= take) {
+            uint32_t a = s_free_blocks[i].addr;
+            uint32_t rem = s_free_blocks[i].size - take;
+            if (rem >= 0x10000u) {           // keep remainder (>=64KB) as a free block
+                s_free_blocks[i].addr = a + take;
+                s_free_blocks[i].size = rem;
+            } else {
+                s_free_blocks[i] = s_free_blocks[--s_free_count];   // consume whole block
+            }
+            return a;
+        }
+    }
+    return 0;
+}
+
 static uint32_t lookup_alloc_size(uint32_t addr) {
     for (int i = s_alloc_count - 1; i >= 0; i--) {
         if (s_alloc_sizes[i].addr == addr)
@@ -1778,6 +1830,20 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (size == 0) size = 1;
     if ((size & 0x80000000u) || size > 512u * 1024 * 1024) return 0;
     uint32_t alloc = (size + 0xFFF) & ~0xFFFu;
+    // Reuse a reclaimed (VirtualFree'd) block first — keeps the bump pointer from
+    // marching into OOM under the game's alloc/free churn. The block is already mapped;
+    // re-zero it so it honors VirtualAlloc's zero-fill contract.
+    uint32_t reuse = wg_free_list_take(alloc);
+    if (reuse) {
+        static signed char s_fm = -1;
+        if (s_fm < 0) s_fm = getenv("WG_NO_FASTMEM") ? 0 : 1;
+        if (!s_fm || !wg_blink_mem_set(engine->blink, reuse, 0, alloc)) {
+            uint8_t *z = calloc(1, alloc);
+            if (z) { wg_blink_write_mem(engine->blink, reuse, z, alloc); free(z); }
+        }
+        track_alloc(reuse, size);
+        return reuse;
+    }
     // Region 1 is 0x20000000..0x5F000000 (below the DLL/stack region at 0x60000000).
     // When it fills, jump to REGION 2 at 0xA0000000..0xF0000000 — the 2.5-4GB slice
     // is free (stacks/DLLs stay under ~0x80000000, main stack at 0x7FFF0000, image
@@ -1794,7 +1860,10 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (s_heap_ptr < (uint32_t)(WG_THUNK_BASE + 0x20000u) &&
         s_heap_ptr + alloc > (uint32_t)WG_THUNK_BASE)
         s_heap_ptr = (uint32_t)(WG_THUNK_BASE + 0x20000u);   // skip past the thunk hole
-    uint32_t hi = (s_heap_ptr >= 0xA0000000u) ? 0xF0000000u : 0x5F000000u;
+    // Region 2 runs to just under the 4GB guest-VA ceiling (Path B caps at 4GB). This
+    // extra ~256MB above the old 0xF0000000 cap + the free-list reclaim keeps a full
+    // UE4 asset load under the OOM line.
+    uint32_t hi = (s_heap_ptr >= 0xA0000000u) ? 0xFFFF0000u : 0x5F000000u;
     if (s_heap_ptr + alloc > hi || s_heap_ptr + alloc < s_heap_ptr) {
         static int s_oom = 0;
         if (s_oom++ < 30) WG_LOGW(TAG, "★ wg_guest_alloc OOM #%d: heap_ptr=0x%X + alloc=0x%X > hi=0x%X — 32-bit guest heap EXHAUSTED (VirtualAlloc/HeapAlloc returns 0)", s_oom, s_heap_ptr, alloc, hi);
@@ -1830,17 +1899,55 @@ static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t
 // endpoint). blink is a 64-bit VM (wg_blink_load_code takes a u64 addr), and the
 // runtime uses nothing above 0x140000000, so hand VirtualAlloc pools out of a huge
 // 64-bit region far above everything. The game is 64-bit, so it uses these fine.
-static uint64_t s_heap64_ptr = 0x200000000ULL;  // 8GB base (above the 0x140000000 imagebase), grows to <24GB
+// Region 3: guest VA 0x100000000..0x200000000 (the 4..8GB upper half of Path B's 8GB
+// linear region). Large VirtualAlloc pools live here so they don't exhaust the sub-4GB
+// 32-bit heap. Capped at 8GB (the linear region end) — a reserve past it fails cleanly.
+#define WG_HEAP64_BASE 0x100000000ULL
+#define WG_HEAP64_END  0x1FFF00000ULL
+static uint64_t s_heap64_ptr = WG_HEAP64_BASE;
+// Region-3 free list + size tracking so VirtualFree of a large pool RECLAIMS it. Without
+// this, the game's buffer-grow churn (alloc bigger, memcpy, free old) leaks region 3 too
+// and 8GB still OOMs.
+#define WG_MAX_ALLOC64 8192
+static struct { uint64_t addr; uint64_t size; } s_alloc64[WG_MAX_ALLOC64]; static int s_alloc64_n = 0;
+static struct { uint64_t addr; uint64_t size; } s_free64[WG_MAX_ALLOC64];  static int s_free64_n = 0;
+static void wg_track_alloc64(uint64_t addr, uint64_t size) {
+    if (s_alloc64_n < WG_MAX_ALLOC64) { s_alloc64[s_alloc64_n].addr = addr; s_alloc64[s_alloc64_n].size = size; s_alloc64_n++; }
+}
+static uint64_t wg_free_take64(uint64_t size) {
+    uint64_t take = (size + 0xFFFFULL) & ~0xFFFFULL;   // 64KB granularity (see wg_free_list_take)
+    for (int i = 0; i < s_free64_n; i++) {
+        if (s_free64[i].size >= take) {
+            uint64_t a = s_free64[i].addr, rem = s_free64[i].size - take;
+            if (rem >= 0x10000ULL) { s_free64[i].addr = a + take; s_free64[i].size = rem; }
+            else s_free64[i] = s_free64[--s_free64_n];
+            return a;
+        }
+    }
+    return 0;
+}
+static void wg_guest_free64(uint64_t addr) {
+    if (addr < WG_HEAP64_BASE) return;
+    uint64_t size = 0;
+    for (int i = s_alloc64_n - 1; i >= 0; i--) if (s_alloc64[i].addr == addr) { size = s_alloc64[i].size; break; }
+    if (!size) return;
+    size = (size + 0xFFFULL) & ~0xFFFULL;
+    if (s_free64_n < WG_MAX_ALLOC64) { s_free64[s_free64_n].addr = addr; s_free64[s_free64_n].size = size; s_free64_n++; }
+}
 // Reserve address space only (NO backing map) — a MEM_RESERVE, so a multi-GB
-// reservation costs nothing until pages are committed.
+// reservation costs nothing until pages are committed. Reuses a reclaimed block first.
 static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align) {
     if (size == 0) size = 1;
     if (align < 0x1000ULL) align = 0x1000ULL;
+    uint64_t reuse = wg_free_take64((size + 0xFFFULL) & ~0xFFFULL);
+    if (reuse) { wg_track_alloc64(reuse, size); return reuse; }
     s_heap64_ptr = (s_heap64_ptr + (align - 1)) & ~(align - 1);
     uint64_t addr = s_heap64_ptr;
     uint64_t alloc = (size + 0xFFFULL) & ~0xFFFULL;
+    if (addr + alloc > WG_HEAP64_END) return 0;   // region 3 full (won't fit the 8GB map)
     s_heap64_ptr += alloc;
     s_heap64_ptr = (s_heap64_ptr + 0xFFFULL) & ~0xFFFULL;
+    wg_track_alloc64(addr, size);
     return addr;
 }
 // Commit: back [addr,addr+size) with real zeroed pages in blink (<=4MB chunks).
@@ -3532,6 +3639,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (entry) {
         const char *fn = entry->func_name;
 
+        // DIAG: identify a thunk the MAIN gets stuck spinning on (same fn 5000x in a row).
+        if (s_cur_guest_tid == 1) {
+            static const char *s_lastfn = 0; static unsigned s_samefn = 0;
+            if (fn == s_lastfn) { if (++s_samefn == 5000) WG_LOGW(TAG, "*** MAIN spinning on thunk %s @0x%llX (rip)", fn, (unsigned long long)rip); }
+            else { s_samefn = 0; s_lastfn = fn; }
+        }
+
         // WG_POLLYIELD: general busy-wait breaker for the post-swapchain async-load
         // coordination. The main thread polls a worker-produced buffer/flag through
         // MANY sites (PeekMessageW empty, memcmp, wcsstr, _wtoi64, ... — each seen as
@@ -4315,7 +4429,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 uint16_t arch = 9; memcpy(si + 0, &arch, 2);   // PROCESSOR_ARCHITECTURE_AMD64
                 v32 = 4096;        memcpy(si + 4,  &v32, 4);   // dwPageSize
                 v64 = 0x00010000;  memcpy(si + 8,  &v64, 8);   // lpMinimumApplicationAddress
-                v64 = 0x800000000ULL; memcpy(si + 16, &v64, 8);  // lpMaximumApplicationAddress (32GB — must cover the 64-bit VirtualAlloc heap at 0x200000000.. so FMallocBinned2 accepts those large-pool pointers; reserves there are address-space-only (cheap) and committed on demand, so a big pool reservation no longer exhausts the guest)
+                v64 = 0x1FF000000ULL; memcpy(si + 16, &v64, 8);  // lpMaximumApplicationAddress (~8GB — must cover region 3 (guest 4..8GB) where large VirtualAlloc pools live, so FMallocBinned2 accepts those pool pointers; Path B's linear region is 8GB)
                 v64 = wg_cpumask(); memcpy(si + 24, &v64, 8);  // dwActiveProcessorMask
                 v32 = wg_ncpu();   memcpy(si + 32, &v32, 4);   // dwNumberOfProcessors
                 v32 = 8664;        memcpy(si + 36, &v32, 4);   // dwProcessorType
@@ -5595,35 +5709,41 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0;                     // Windows: size 0 -> ERROR_INVALID_PARAMETER
                 s_last_error = 87;
             } else if (va_addr != 0) {
-                // Commit into an existing reservation. For the 64-bit heap the reserve
-                // handed back address space only, so back this sub-range with real pages
-                // now (if committing). 32-bit heap regions are already backed.
-                if (va_addr >= 0x200000000ull && (va_type & 0x1000))
+                // Commit into an existing reservation. Region-3 reserves handed back
+                // address space only, so back this sub-range with pages now (if committing).
+                if (va_addr >= WG_HEAP64_BASE && (va_type & 0x1000))
                     wg_guest_map64(engine, va_addr, va_size);
                 ret_val = va_addr;
-            } else if (engine->pe_image && engine->pe_image->is_64bit &&
-                       va_size >= 64ull * 1024 * 1024) {
-                // LARGE pool -> the huge 64-bit heap (0x200000000+, grows to 24GB). The
-                // 32-bit heap is only ~2.75GB and WineGlass's bump allocator never frees,
-                // so a full UE4 asset load's alloc/free churn exhausts it -> FMalloc OOM
-                // -> fatal exit right before the UI renders. Big pools go 64-bit (their
-                // pointers flow through args64-aware mem handlers); small allocs stay in
-                // the 32-bit heap so the many 32-bit-only handlers keep working. Reserve
-                // is cheap (address space only); only COMMIT backs pages, so a giant
-                // MEM_RESERVE costs nothing until the game commits sub-ranges.
+            } else if (va_size >= 32ull * 1024 * 1024) {
+                // LARGE pool -> region 3 (guest 4..8GB, Path B's extended linear half).
+                // Keeps the game's big FMallocBinned2 pools out of the ~3GB 32-bit heap so
+                // a full UE4 asset load doesn't OOM. Reserve is address-space-only (cheap);
+                // only MEM_COMMIT backs pages. Its pointers flow through the args64-aware
+                // mem handlers. Falls back to the 32-bit heap if region 3 is full.
                 uint64_t a = wg_guest_reserve64(va_size, 0x10000);
-                if (a && (va_type & 0x1000)) {   // MEM_COMMIT -> back it now
-                    if (!wg_guest_map64(engine, a, va_size)) a = 0;
-                }
-                ret_val = a;
+                if (a && (va_type & 0x1000)) { if (!wg_guest_map64(engine, a, va_size)) a = 0; }
+                ret_val = a ? a : wg_guest_alloc_aligned(engine, (uint32_t)va_size, 0x10000);
             } else {
                 // Fresh small reservation: align to the OS allocation granularity (64KB).
-                // FMallocBinned2 depends on this alignment for its pool math.
+                // FMallocBinned2 depends on this alignment for its pool math. Small allocs
+                // stay in the 32-bit heap so the many 32-bit-only handlers are unaffected;
+                // the free-list reclaims VirtualFree'd blocks so churn doesn't leak.
                 ret_val = wg_guest_alloc_aligned(engine, (uint32_t)va_size, 0x10000);
             }
             WG_LOGI(TAG, "VirtualAlloc(addr=0x%llX, size=%llu, type=0x%X) -> 0x%llX",
                     (unsigned long long)va_addr, (unsigned long long)va_size, va_type,
                     (unsigned long long)ret_val);
+        } else if (strcmp(fn, "VirtualFree") == 0) {
+            // VirtualFree(lpAddress, dwSize, dwFreeType). RECLAIM the block so the guest
+            // heap doesn't leak the game's buffer-grow churn to OOM. MEM_RELEASE(0x8000)
+            // frees the whole reservation (dwSize must be 0); MEM_DECOMMIT(0x4000) frees
+            // a sub-range. Only reclaim on RELEASE. Use args64 for the address so region-3
+            // (>4GB) pool frees are reclaimed too.
+            if (args[2] & 0x8000) {
+                if (args64[0] >= WG_HEAP64_BASE) wg_guest_free64(args64[0]);
+                else wg_guest_free((uint32_t)args64[0], 0);
+            }
+            ret_val = 1;   // TRUE
         } else if (strcmp(fn, "??2@YAPAXI@Z") == 0 ||   // operator new(uint)
                    strcmp(fn, "malloc") == 0) {
             // CRT allocators used by real DLLs (StdUtils, etc.). Returning 0
@@ -7706,7 +7826,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 if (s_heap_ptr < (uint32_t)(WG_THUNK_BASE + 0x20000u) &&
                     s_heap_ptr + size > (uint32_t)WG_THUNK_BASE)
                     s_heap_ptr = (uint32_t)(WG_THUNK_BASE + 0x20000u);  // skip thunk hole
-                uint32_t hi7 = (s_heap_ptr >= 0xA0000000u) ? 0xF0000000u : 0x5F000000u;
+                uint32_t hi7 = (s_heap_ptr >= 0xA0000000u) ? 0xFFFF0000u : 0x5F000000u;
                 if (s_heap_ptr + size > hi7 || s_heap_ptr + size < s_heap_ptr) {
                     ret_val = 0; // heap full (both regions)
                 } else {
