@@ -2806,13 +2806,13 @@ static void wg_dump_threads(WGEngine *engine, const char *why) {
 // generic thunk epilogue's RSP handling is correct for x64.
 
 // Read a NUL-terminated narrow string from guest memory into buf (bounded).
-static void wg_read_cstr(WGEngine *e, uint32_t addr, char *buf, int cap) {
+static void wg_read_cstr(WGEngine *e, uint64_t addr, char *buf, int cap) {
     if (!addr || cap <= 0) { if (cap > 0) buf[0] = 0; return; }
     int i = 0;
     while (i < cap - 1) {
         int n = (cap - 1 - i) < 256 ? (cap - 1 - i) : 256;
         char chunk[256];
-        wg_blink_read_mem(e->blink, addr + (uint32_t)i, chunk, n);
+        wg_blink_read_mem(e->blink, addr + (uint64_t)i, chunk, n);
         for (int j = 0; j < n; j++) {
             buf[i + j] = chunk[j];
             if (!chunk[j]) return;
@@ -2822,13 +2822,13 @@ static void wg_read_cstr(WGEngine *e, uint32_t addr, char *buf, int cap) {
     buf[cap - 1] = 0;
 }
 // Read a NUL-terminated wide (UTF-16) string into a uint16_t buf (bounded, chars).
-static void wg_read_wstr(WGEngine *e, uint32_t addr, uint16_t *buf, int cap) {
+static void wg_read_wstr(WGEngine *e, uint64_t addr, uint16_t *buf, int cap) {
     if (!addr || cap <= 0) { if (cap > 0) buf[0] = 0; return; }
     int i = 0;
     while (i < cap - 1) {
         int n = (cap - 1 - i) < 128 ? (cap - 1 - i) : 128;
         uint16_t chunk[128];
-        wg_blink_read_mem(e->blink, addr + (uint32_t)i * 2, chunk, n * 2);
+        wg_blink_read_mem(e->blink, addr + (uint64_t)i * 2, chunk, n * 2);
         for (int j = 0; j < n; j++) {
             buf[i + j] = chunk[j];
             if (!chunk[j]) return;
@@ -4092,13 +4092,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
             char text[2048] = {0}, cap[512] = {0};
             if (fn[10] == 'W') {  // MessageBoxW
                 uint16_t wt[2048], wc[512];
-                wg_read_wstr(engine, (uint32_t)args64[1], wt, 2048);
-                wg_read_wstr(engine, (uint32_t)args64[2], wc, 512);
+                wg_read_wstr(engine, args64[1], wt, 2048);
+                wg_read_wstr(engine, args64[2], wc, 512);
                 for (int i = 0; i < 2047 && wt[i]; i++) text[i] = (char)(wt[i] < 128 ? wt[i] : '?');
                 for (int i = 0; i < 511  && wc[i]; i++) cap[i]  = (char)(wc[i] < 128 ? wc[i] : '?');
             } else {
-                wg_read_cstr(engine, (uint32_t)args64[1], text, sizeof text);
-                wg_read_cstr(engine, (uint32_t)args64[2], cap, sizeof cap);
+                wg_read_cstr(engine, args64[1], text, sizeof text);
+                wg_read_cstr(engine, args64[2], cap, sizeof cap);
             }
             WG_LOGE(TAG, "*** MessageBox [%s]: %s", cap, text);
         }
@@ -6292,7 +6292,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // (>4GB) pool frees are reclaimed too.
             if (args[2] & 0x8000) {
                 if (args64[0] >= WG_HEAP64_BASE) wg_guest_free64(args64[0]);
-                else wg_guest_free((uint32_t)args64[0], 0);
+                else wg_guest_free(args64[0], 0);
             } else if ((args[2] & 0x4000) && args64[0] >= WG_HEAP64_BASE) {
                 // MEM_DECOMMIT of a region-3 sub-range: mark it uncommitted so a
                 // later re-commit re-zeroes it (Windows semantics), matching the
@@ -8068,7 +8068,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // object tables -> crash in the level-load hash walk (0x8f29c4).
             // args64[i] == args[i] for 32-bit guests, so this is universally safe.
             uint64_t buf_addr = args64[1];
-            uint32_t nbytes = (uint32_t)args64[2];
+            uint32_t nbytes = args64[2];
             uint64_t bytes_read_addr = args64[3];
             uint64_t overlapped_addr = args64[4];
             // Cap per-read to bound the temp malloc, but 1MB was TOO SMALL: the SM5
@@ -8134,7 +8134,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // Full 64-bit pointers (see ReadFile): buffers may live in region-3
             // (>4GB). args64[i] == args[i] for 32-bit guests.
             uint64_t buf_addr = args64[1];
-            uint32_t nbytes = (uint32_t)args64[2];
+            uint32_t nbytes = args64[2];
             uint64_t bytes_written_addr = args64[3];
             // NOTE: do NOT truncate nbytes here. A previous 1MB cap silently
             // dropped the tail of large writes; Steam's package save requires
