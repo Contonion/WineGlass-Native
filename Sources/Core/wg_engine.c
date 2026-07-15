@@ -1333,7 +1333,7 @@ static void map_thunks_to_blink(WGEngine *engine) {
 // [RCX,RDX) and RETs to the caller. (A no-op stub instead leaves every static
 // C++ constructor unrun — a UE4 game then derefs null singletons everywhere.)
 // Must be mapped AFTER the PE sections load, or .text overwrites it.
-static void map_initterm_tramp(WGEngine *engine, uint32_t addr) {
+static void map_initterm_tramp(WGEngine *engine, uint64_t addr) {
     static const uint8_t tramp[] = {
         0x53,                               // push rbx
         0x56,                               // push rsi
@@ -1361,7 +1361,7 @@ static void map_initterm_tramp(WGEngine *engine, uint32_t addr) {
     memset(page, 0xF4, sizeof(page));       // HLT-fill the rest
     memcpy(page, tramp, sizeof(tramp));
     wg_blink_load_code(engine->blink, addr, page, sizeof(page), 0);
-    WG_LOGI(TAG, "x64 _initterm trampoline mapped at 0x%X", addr);
+    WG_LOGI(TAG, "x64 _initterm trampoline mapped at 0x%llX", (unsigned long long)addr);
 }
 
 // ============================================================
@@ -9680,8 +9680,10 @@ static bool load_pe_blink(WGEngine *engine) {
             for (int j = 0; j < imp->num_functions; j++) {
                 uint64_t stub_addr = wg_dll_mapper_resolve(
                     engine->dll_mapper, imp->dll_name, imp->functions[j].name);
+                uint64_t iat_entry = pe->image_base + imp->functions[j].iat_rva;
+                WG_LOGI(TAG, "    IAT[%s] @0x%llX <- thunk 0x%llX", imp->functions[j].name,
+                        (unsigned long long)iat_entry, (unsigned long long)stub_addr);
                 if (stub_addr) {
-                    uint64_t iat_entry = pe->image_base + imp->functions[j].iat_rva;
                     uint8_t addr_bytes[8];
                     memcpy(addr_bytes, &stub_addr, 8);
                     wg_blink_write_mem(engine->blink, iat_entry, addr_bytes, 8);
@@ -9701,6 +9703,15 @@ static bool load_pe_blink(WGEngine *engine) {
     // NOW switch to 32-bit mode if this is a 32-bit PE
     if (!pe->is_64bit) {
         wg_blink_switch_to_32bit(engine->blink);
+    }
+
+    if (getenv("WG_DIAG_IAT")) {   // read-back: does guest memory hold what we wrote?
+        uint64_t iatv = 0; uint8_t eb[8] = {0};
+        wg_blink_read_mem(engine->blink, 0x140005048, &iatv, 8);
+        wg_blink_read_mem(engine->blink, entry, eb, 8);
+        WG_LOGW(TAG, "DIAG: [0x140005048]=0x%llX  entry@0x%llX bytes=%02X%02X%02X%02X%02X%02X",
+                (unsigned long long)iatv, (unsigned long long)entry,
+                eb[0],eb[1],eb[2],eb[3],eb[4],eb[5]);
     }
 
     // Set up the Win32 thread environment (TEB/PEB/TLS + FS base) so real MSVC

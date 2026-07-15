@@ -24,8 +24,8 @@
 // region here per VM load and tells us where via wg_winsock_set_gai_base()
 // (it's relocated above the image for large 64-bit PEs). Defaults to the legacy
 // low address for small/32-bit guests.
-static uint32_t s_gai_base = 0x00B00000u;
-void wg_winsock_set_gai_base(uint32_t base) { if (base) s_gai_base = base; }
+static uint64_t s_gai_base = 0x00B00000u;   // 64-bit: box64 relocates this above 4GB
+void wg_winsock_set_gai_base(uint64_t base) { if (base) s_gai_base = base; }
 
 // ── Windows socket constants ────────────────────────────────────────
 #define WSADESCRIPTION_LEN  256

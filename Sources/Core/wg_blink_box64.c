@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <execinfo.h>
+#include <signal.h>
 
 #include "box64context.h"
 #include "x64emu.h"
@@ -70,21 +72,34 @@ static bool ht_has_or_add(uint64_t chunk) {
     }
     return true; // table full — treat as present (best effort)
 }
+// Apple Silicon reserves the low 4 GB, so guest addresses there can never be
+// identity-mapped. Treat them as not-present (read 0 / discard write) — the engine's
+// real guest structures are relocated above 4 GB on the box64 path; only stray
+// diagnostic probes (Visage-specific hardcoded low addresses) land here.
+#define WG_LOW_LIMIT 0x100000000ULL
+
 // Ensure [addr, addr+len) is backed by host memory, mapping new 64 KiB chunks.
-static void ensure_mapped(uint64_t addr, uint64_t len) {
-    if (!len) return;
+// Returns false if any part is unmappable (below 4 GB or a failed reservation).
+static bool ensure_mapped(uint64_t addr, uint64_t len) {
+    if (!len) return true;
+    if (addr < WG_LOW_LIMIT) return false;             // low 4 GB: never mappable
     uint64_t c0 = addr >> WG_CHUNK_SHIFT;
     uint64_t c1 = (addr + len - 1) >> WG_CHUNK_SHIFT;
+    bool ok = true;
     for (uint64_t c = c0; c <= c1; ++c) {
         if (ht_has_or_add(c)) continue;
         void* base = (void*)(uintptr_t)(c << WG_CHUNK_SHIFT);
         void* got = mmap(base, WG_CHUNK_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         if (got == MAP_FAILED) {
-            // Fall back to a non-fixed map is useless for identity; log once.
-            fprintf(stderr, "[box64] ensure_mapped: mmap FIXED @%p failed\n", base);
+            static int warned = 0;
+            if (warned++ < 20)
+                fprintf(stderr, "[box64] ensure_mapped: mmap @%p failed (guest 0x%llx) — box64-reserved?\n",
+                        base, (unsigned long long)addr);
+            ok = false;
         }
     }
+    return ok;
 }
 
 // ---- instance --------------------------------------------------------------
@@ -96,12 +111,29 @@ typedef struct wg_inst {
 } wg_inst;
 
 static box64context_t* g_ctx = NULL;
+static x64emu_t* volatile s_run_emu = NULL;   // emu currently in Run(), for the SIGSEGV diag
+
+static void wg_box64_segv(int sig, siginfo_t* si, void* uc) {
+    (void)uc;
+    x64emu_t* e = s_run_emu;
+    fprintf(stderr, "[box64] SIG%d fault@%p  guest RIP=0x%llx RSP=0x%llx RAX=0x%llx RCX=0x%llx\n",
+            sig, si ? si->si_addr : 0,
+            e ? (unsigned long long)e->ip.q[0] : 0,
+            e ? (unsigned long long)e->regs[_SP].q[0] : 0,
+            e ? (unsigned long long)e->regs[_AX].q[0] : 0,
+            e ? (unsigned long long)e->regs[_CX].q[0] : 0);
+    _exit(139);
+}
+
 static void ensure_context(void) {
     if (g_ctx) return;
     if (!ftrace) ftrace = stderr;
     if (!box64_pagesize) box64_pagesize = (uintptr_t)sysconf(_SC_PAGESIZE);
     box64_unittest_mode = 1;                 // HLT -> clean emu->quit (thunk stop)
     g_ctx = NewBox64Context(0);
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = wg_box64_segv; sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);   // override box64's
 }
 
 #define EMU(i) (((wg_inst*)(i))->emu)
@@ -126,14 +158,22 @@ void wg_blink_switch_to_32bit(WGBlinkInstance* i) { EMU(i)->segs[_CS] = 0x23; ((
 bool wg_blink_load_binary(WGBlinkInstance* i, const char* p) { (void)i; (void)p; return false; }
 
 bool wg_blink_setup_stack(WGBlinkInstance* i, uint64_t entry_rip) {
+    // box64 executes stack pushes DIRECTLY on the host, so the guest stack must be a
+    // real, mapped, high-address region (blink used 0x7FFF0000, unmappable on Apple
+    // Silicon). Place it in the proven-free 0x1_4000_0000..0x1_FFFF_FFFF window, clear
+    // of the image / thunks / tramp / warm-up.
+    const uint64_t stack_top = 0x1A0000000ULL;
+    const uint64_t stack_sz  = 0x1000000ULL;     // 16 MB (UE4 asks up to ~11MB)
+    ensure_mapped(stack_top - stack_sz, stack_sz);
+    EMU(i)->regs[_SP].q[0] = stack_top - 0x100;   // small gap below the top
     EMU(i)->ip.q[0] = entry_rip;
     return true;
 }
 bool wg_blink_load_code(WGBlinkInstance* i, uint64_t addr, const uint8_t* code,
                         uint32_t size, uint64_t entry_rip) {
-    ensure_mapped(addr, size);
-    memcpy((void*)(uintptr_t)addr, code, size);
-    EMU(i)->ip.q[0] = entry_rip;
+    if (ensure_mapped(addr, size))
+        memcpy((void*)(uintptr_t)addr, code, size);
+    if (entry_rip) EMU(i)->ip.q[0] = entry_rip;   // 0 = "don't change RIP" (thunk/tramp loads)
     return true;
 }
 
@@ -142,7 +182,11 @@ WGBlinkResult wg_blink_run(WGBlinkInstance* i, int max_instructions) {
     (void)max_instructions;               // box64 runs to the next HLT/fault, not a slice
     wg_inst* w = (wg_inst*)i;
     box64_unittest_mode = 1;
+    // RIP==0 is the engine's "process exited" signal (ExitProcess sets it). blink
+    // halts there; box64 would fetch at host 0 and SIGSEGV — so halt cleanly instead.
+    if (w->emu->ip.q[0] == 0) { w->last_stop = -1; return WG_BLINK_HALT; }
     w->emu->quit = 0;
+    s_run_emu = w->emu;
     Run(w->emu, 0);                        // interpreter (JIT via EmuRun is a later step)
     if (w->emu->quit) {
         // box64 leaves RIP AT the HLT (thunk) address on quit — matches blink's
@@ -177,17 +221,24 @@ uint64_t wg_blink_get_fault_addr(WGBlinkInstance* i)           { return ((wg_ins
 
 // ---- memory (demand-paged identity) ---------------------------------------
 bool wg_blink_write_mem(WGBlinkInstance* i, uint64_t addr, const void* buf, uint32_t len) {
-    (void)i; ensure_mapped(addr, len); memcpy((void*)(uintptr_t)addr, buf, len); return true;
+    (void)i;
+    if (!ensure_mapped(addr, len)) return true;   // unmappable (low 4GB) — discard, like not-present
+    memcpy((void*)(uintptr_t)addr, buf, len); return true;
 }
 bool wg_blink_read_mem(WGBlinkInstance* i, uint64_t addr, void* buf, uint32_t len) {
-    (void)i; ensure_mapped(addr, len); memcpy(buf, (void*)(uintptr_t)addr, len); return true;
+    (void)i;
+    if (!ensure_mapped(addr, len)) { memset(buf, 0, len); return true; }  // not-present -> zeros
+    memcpy(buf, (void*)(uintptr_t)addr, len); return true;
 }
 uint64_t wg_blink_mem_copy(WGBlinkInstance* i, uint64_t dst, uint64_t src, uint64_t n) {
-    (void)i; ensure_mapped(dst, n); ensure_mapped(src, n);
+    (void)i;
+    if (!ensure_mapped(dst, n) || !ensure_mapped(src, n)) return dst;
     memcpy((void*)(uintptr_t)dst, (void*)(uintptr_t)src, n); return dst;
 }
 uint64_t wg_blink_mem_set(WGBlinkInstance* i, uint64_t dst, int c, uint64_t n) {
-    (void)i; ensure_mapped(dst, n); memset((void*)(uintptr_t)dst, c, n); return dst;
+    (void)i;
+    if (!ensure_mapped(dst, n)) return dst;
+    memset((void*)(uintptr_t)dst, c, n); return dst;
 }
 
 // ---- real-threads (a Machine/emu per guest thread) -------------------------

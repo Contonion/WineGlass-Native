@@ -21,7 +21,7 @@ uint32_t wg_winsock_get_last_error(WGWinsock *ws);
 
 // Tell winsock where the engine mapped the getaddrinfo result scratch region
 // (relocated above the image for large 64-bit PEs).
-void     wg_winsock_set_gai_base(uint32_t base);
+void     wg_winsock_set_gai_base(uint64_t base);
 void     wg_winsock_set_last_error(WGWinsock *ws, uint32_t err);
 
 // Reactor backstop: true if any open socket has data ready to read.
