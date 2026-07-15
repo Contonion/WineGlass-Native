@@ -8949,15 +8949,29 @@ static bool ensure_blink_vm(WGEngine *engine, bool is_64bit) {
 // without a real GS base + TLS array the global allocator (GMalloc) is never
 // created and every allocation returns null, which is exactly what stalled
 // static init. Also sets the PE's static TLS block in slot 0.
+// High guest-structure bump allocator for the box64 path — all guest memory must
+// live above 4GB (Apple Silicon reserves the low 4GB; box64 is identity-mapped).
+// Lives in the proven-free 0x1_4000_0000..0x1_FFFF_FFFF window, above the stack.
+static uint64_t s_hi_alloc = 0x1D0000000ULL;
+static uint64_t wg_guest_alloc_hi(uint32_t size) {
+    uint64_t a = (s_hi_alloc + 0xFFF) & ~0xFFFULL;
+    s_hi_alloc = a + (((uint64_t)size + 0xFFF) & ~0xFFFULL);
+    return a;
+}
+// Pick low (blink) or high (box64) guest allocation for a structure.
+static uint64_t wg_guest_alloc_auto(WGEngine *engine, uint32_t size) {
+    return wg_cpu_is_box64() ? wg_guest_alloc_hi(size) : (uint64_t)wg_guest_alloc(engine, size);
+}
+
 static void wg_setup_win32_teb64(WGEngine *engine) {
     WGPEImage *pe = engine->pe_image;
     void *bl = engine->blink;
-    uint32_t teb = wg_guest_alloc(engine, 0x2000);   // x64 TEB is ~0x1800
-    uint32_t peb = wg_guest_alloc(engine, 0x1000);
-    uint32_t tls_array = wg_guest_alloc(engine, 0x400);   // 128 slots * 8
+    uint64_t teb = wg_guest_alloc_auto(engine, 0x2000);   // x64 TEB is ~0x1800
+    uint64_t peb = wg_guest_alloc_auto(engine, 0x1000);
+    uint64_t tls_array = wg_guest_alloc_auto(engine, 0x400);   // 128 slots * 8
     if (!teb || !peb || !tls_array) return;
 
-    uint32_t image_base  = (uint32_t)pe->image_base;
+    uint64_t image_base  = pe->image_base;   // full 64-bit (must not truncate for box64)
     uint64_t stack_base  = 0x7FFF0000, stack_limit = 0x7EFF0000;
     uint64_t v64; uint32_t v32;
 
@@ -8984,7 +8998,7 @@ static void wg_setup_win32_teb64(WGEngine *engine) {
     // PE static TLS (IMAGE_TLS_DIRECTORY64 — 8-byte fields). Allocate + copy the
     // template into a data block and put its pointer in TLS array slot 0, with
     // the module's _tls_index (at AddressOfIndex) set to 0 so gs:[0x58][0] hits it.
-    uint32_t tls_data = 0;
+    uint64_t tls_data = 0;
     if (pe->tls_rva) {
         uint64_t raw_start = 0, raw_end = 0, addr_index = 0; uint32_t zerofill = 0;
         wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x00, &raw_start, 8);
@@ -8993,21 +9007,22 @@ static void wg_setup_win32_teb64(WGEngine *engine) {
         wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x20, &zerofill, 4);
         uint32_t tpl = (raw_end > raw_start) ? (uint32_t)(raw_end - raw_start) : 0;
         uint32_t data_size = tpl + zerofill; if (!data_size) data_size = 8;
-        tls_data = wg_guest_alloc(engine, data_size);
+        tls_data = wg_guest_alloc_auto(engine, data_size);
         if (tls_data && tpl) {
             uint8_t *tmp = malloc(tpl);
-            if (tmp) { wg_blink_read_mem(bl, (uint32_t)raw_start, tmp, tpl);
+            if (tmp) { wg_blink_read_mem(bl, raw_start, tmp, tpl);   // full 64-bit ptr
                        wg_blink_write_mem(bl, tls_data, tmp, tpl); free(tmp); }
         }
-        if (addr_index) { uint32_t z = 0; wg_blink_write_mem(bl, (uint32_t)addr_index, &z, 4); }
-        WG_LOGI(TAG, "TLS64: data@0x%X size 0x%X (index 0)", tls_data, data_size);
+        if (addr_index) { uint32_t z = 0; wg_blink_write_mem(bl, addr_index, &z, 4); }
+        WG_LOGI(TAG, "TLS64: data@0x%llX size 0x%X (index 0)", (unsigned long long)tls_data, data_size);
     }
-    if (!tls_data) tls_data = wg_guest_alloc(engine, 0x100); // valid zeroed block regardless
+    if (!tls_data) tls_data = wg_guest_alloc_auto(engine, 0x100); // valid zeroed block regardless
     v64 = tls_data; wg_blink_write_mem(bl, tls_array, &v64, 8);  // array[0]
 
     wg_blink_set_gs_base(engine->blink, teb);
     s_main_teb = teb;
-    WG_LOGI(TAG, "Win32 x64 TEB@0x%X PEB@0x%X TLS@0x%X gs-base set", teb, peb, tls_array);
+    WG_LOGI(TAG, "Win32 x64 TEB@0x%llX PEB@0x%llX TLS@0x%llX gs-base set",
+            (unsigned long long)teb, (unsigned long long)peb, (unsigned long long)tls_array);
 }
 
 // Build a minimal 32-bit TEB/PEB + TLS and point FS at the TEB. MSVC's CRT reads
@@ -9953,10 +9968,12 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
             engine->pe_image->entry_point,
             (unsigned long long)engine->pe_image->image_base);
 
-    // PE32+ images prefer 0x140000000 — above 4GB. Every Win32 handler carries
-    // guest pointers through 32-bit args (and the PEB/thunk plumbing assumes a
-    // sub-4GB guest), so rebase such images down to the classic 0x400000.
-    if (engine->pe_image->is_64bit &&
+    // PE32+ images prefer 0x140000000 — above 4GB. On the BLINK path every Win32
+    // handler carries guest pointers through 32-bit args (and the PEB/thunk plumbing
+    // assumes a sub-4GB guest), so rebase such images down to the classic 0x400000.
+    // On the BOX64 path the opposite is true: box64 is identity-mapped and Apple
+    // Silicon reserves the low 4GB, so the image MUST stay high — do NOT rebase down.
+    if (!wg_cpu_is_box64() && engine->pe_image->is_64bit &&
         engine->pe_image->image_base + engine->pe_image->size_of_image > 0xE0000000ULL) {
         if (!wg_pe_rebase(engine->pe_image, 0x00400000ULL)) {
             WG_LOGW(TAG, "64-bit image base 0x%llx not rebasable — pointers may "
@@ -9993,8 +10010,9 @@ bool wg_engine_load_pe_memory(WGEngine *engine, const uint8_t *data, size_t size
             engine->pe_image->entry_point,
             engine->pe_image->num_imports);
 
-    // Same sub-4GB rebase as wg_engine_load_pe (see comment there).
-    if (engine->pe_image->is_64bit &&
+    // Same sub-4GB rebase as wg_engine_load_pe (see comment there) — blink only;
+    // box64 keeps the image high (identity-mapped, low 4GB reserved on Apple Silicon).
+    if (!wg_cpu_is_box64() && engine->pe_image->is_64bit &&
         engine->pe_image->image_base + engine->pe_image->size_of_image > 0xE0000000ULL) {
         wg_pe_rebase(engine->pe_image, 0x00400000ULL);
     }
