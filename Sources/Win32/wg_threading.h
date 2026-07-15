@@ -29,11 +29,11 @@ typedef struct {
     WGThreadState state;
     uint32_t      id;
     uint32_t      handle;        // Win32 thread handle
-    uint32_t      stack_base;    // guest address of stack bottom
+    uint64_t      stack_base;    // guest address of stack bottom (64-bit: box64 >4GB)
     uint32_t      stack_size;
-    uint32_t      teb;           // guest address of TEB
-    uint32_t      start_addr;    // thread entry point
-    uint32_t      param;         // thread parameter
+    uint64_t      teb;           // guest address of TEB (64-bit)
+    uint64_t      start_addr;    // thread entry point (64-bit)
+    uint64_t      param;         // thread parameter (64-bit)
     uint32_t      exit_code;
     uint32_t      wait_handle;   // handle being waited on (0 = not waiting)
     uint32_t      wait_timeout;  // timeout in ms (INFINITE = 0xFFFFFFFF)
@@ -48,7 +48,7 @@ typedef struct {
     int      count;              // total threads created
     uint32_t next_id;
     uint32_t next_handle;
-    uint32_t next_stack_addr;    // bump allocator for thread stacks
+    uint64_t next_stack_addr;    // bump allocator for thread stacks (64-bit)
 } WGThreadScheduler;
 
 WGThreadScheduler *wg_sched_create(void);
@@ -56,7 +56,7 @@ void               wg_sched_destroy(WGThreadScheduler *sched);
 
 // Create a new thread. Returns the Win32 thread handle.
 uint32_t wg_sched_create_thread(WGThreadScheduler *sched, void *blink,
-                                 uint32_t start_addr, uint32_t param,
+                                 uint64_t start_addr, uint64_t param,
                                  uint32_t flags, uint32_t *out_tid);
 
 // Save current thread's state from blink and mark it as `new_state`.

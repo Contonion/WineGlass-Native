@@ -1163,11 +1163,11 @@ static bool tmsg_pop(uint32_t tid, uint32_t *msg, uint32_t *wp, uint32_t *lp) {
     }
     return false;
 }
-static uint32_t s_main_teb = 0; // TEB address of main thread
+static uint64_t s_main_teb = 0; // TEB address of main thread (64-bit: box64 TEB >4GB)
 // Allocate a per-thread TEB (own TLS array, stack bounds, ClientId) sharing the
 // process PEB. Returns the TEB guest address, or 0 on failure. Defined later.
-static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
-                                    uint32_t stack_limit, uint32_t tid);
+static uint64_t wg_alloc_thread_teb(WGEngine *engine, uint64_t stack_base,
+                                    uint64_t stack_limit, uint32_t tid);
 static bool s_cmdpage_mapped = false;
 static uint32_t s_nsis_exe_data_offset = 0;
 static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
@@ -6889,7 +6889,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "CreateThread") == 0) {
             // CreateThread(secAttr, stackSize, start=args[2], param=args[3],
             //              flags=args[4], lpThreadId=args[5]).
-            uint32_t start = args[2], param = args[3], flags = args[4];
+            uint64_t start = args[2], param = args[3]; uint32_t flags = (uint32_t)args[4];
             uint32_t tid = 0;
             uint32_t hthread = 0;
             bool ct_real = false;
@@ -6910,9 +6910,10 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     // Give the new thread its own TEB (stack bounds, ClientId, TLS).
                     WGThread *nt = wg_sched_find(engine->scheduler, hthread);
                     if (nt) {
-                        uint32_t teb = wg_alloc_thread_teb(engine,
+                        uint64_t teb = wg_alloc_thread_teb(engine,
                             nt->stack_base + nt->stack_size, nt->stack_base, tid);
-                        if (teb) { nt->teb = teb; nt->regs.fs_base = teb; }
+                        if (teb) { nt->teb = teb; nt->regs.fs_base = teb;
+                                   if (wg_cpu_is_box64()) nt->regs.gs_base = teb; }
                     }
                 } else {
                     // Fallback: run synchronously (for NSIS compatibility)
@@ -9234,16 +9235,16 @@ static void wg_setup_win32_teb(WGEngine *engine) {
 // pointer. Sharing the main TEB (the old behavior) corrupted per-thread state.
 // Shares the process PEB (read from the main TEB) and re-instantiates the static
 // TLS data block so __declspec(thread) data is per-thread too.
-static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
-                                    uint32_t stack_limit, uint32_t tid) {
+static uint64_t wg_alloc_thread_teb(WGEngine *engine, uint64_t stack_base,
+                                    uint64_t stack_limit, uint32_t tid) {
     WGPEImage *pe = engine->pe_image;
     if (!pe || !s_main_teb) return 0;
 
     if (pe->is_64bit) {
         // x64 per-thread TEB (GS-based, 8-byte fields). Shares the process PEB.
         void *bl = engine->blink;
-        uint32_t teb = wg_guest_alloc(engine, 0x2000);
-        uint32_t tls_array = wg_guest_alloc(engine, 0x400);
+        uint64_t teb = wg_guest_alloc(engine, 0x2000);
+        uint64_t tls_array = wg_guest_alloc(engine, 0x400);
         if (!teb || !tls_array) return 0;
         uint64_t peb = 0;
         wg_blink_read_mem(bl, s_main_teb + 0x60, &peb, 8);
@@ -9258,9 +9259,9 @@ static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
         v64 = peb;            wg_blink_write_mem(bl, teb + 0x60, &v64, 8); // PEB
         uint32_t z = 0;       wg_blink_write_mem(bl, teb + 0x68, &z, 4);   // LastError
         // Per-thread static TLS block (__declspec(thread)) from the TLS dir.
-        uint32_t tls_data = 0;
+        uint64_t tls_data = 0;
         if (pe->tls_rva) {
-            uint32_t image_base = (uint32_t)pe->image_base;
+            uint64_t image_base = pe->image_base;
             uint64_t raw_start = 0, raw_end = 0; uint32_t zerofill = 0;
             wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x00, &raw_start, 8);
             wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x08, &raw_end, 8);
@@ -9269,12 +9270,14 @@ static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
             uint32_t data_size = tpl + zerofill; if (!data_size) data_size = 8;
             tls_data = wg_guest_alloc(engine, data_size);
             if (tls_data && tpl) { uint8_t *tmp = malloc(tpl);
-                if (tmp) { wg_blink_read_mem(bl, (uint32_t)raw_start, tmp, tpl);
+                if (tmp) { wg_blink_read_mem(bl, raw_start, tmp, tpl);
                            wg_blink_write_mem(bl, tls_data, tmp, tpl); free(tmp); } }
         }
         if (!tls_data) tls_data = wg_guest_alloc(engine, 0x100);
         v64 = tls_data; wg_blink_write_mem(bl, tls_array, &v64, 8);
-        WG_LOGI(TAG, "Thread TEB64@0x%X tid=0x%X stack=0x%X-0x%X", teb, tid, stack_limit, stack_base);
+        WG_LOGI(TAG, "Thread TEB64@0x%llX tid=0x%X stack=0x%llX-0x%llX",
+                (unsigned long long)teb, tid, (unsigned long long)stack_limit,
+                (unsigned long long)stack_base);
         return teb;
     }
 
@@ -9600,11 +9603,11 @@ static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
 
     // Allocate + map a 1MB guest stack from the shared thread-stack region
     // (same bump allocator the cooperative scheduler uses, so no collision).
-    uint32_t stack_base = engine->scheduler->next_stack_addr;
+    uint64_t stack_base = engine->scheduler->next_stack_addr;
     engine->scheduler->next_stack_addr += WG_THREAD_STACK + 0x1000;
     uint8_t *zstack = calloc(1, WG_THREAD_STACK);
     if (zstack) { wg_blink_load_code(engine->blink, stack_base, zstack, WG_THREAD_STACK, 0); free(zstack); }
-    uint32_t stack_top = stack_base + WG_THREAD_STACK;
+    uint64_t stack_top = stack_base + WG_THREAD_STACK;
 
     uint32_t tid = engine->scheduler->next_id++;
     uint32_t teb = wg_alloc_thread_teb(engine, stack_top, stack_base, tid);
@@ -9946,7 +9949,8 @@ static bool load_pe_blink(WGEngine *engine) {
         memset(engine->scheduler->threads, 0, sizeof(engine->scheduler->threads));
         engine->scheduler->next_id = 0x1000;
         engine->scheduler->next_handle = 0x7100;
-        engine->scheduler->next_stack_addr = 0x60000000u; // above the heap's growth (see wg_sched_create)
+        // box64: thread stacks must be high (low 4GB reserved on Apple Silicon).
+        engine->scheduler->next_stack_addr = wg_cpu_is_box64() ? 0x50000000000ULL : 0x60000000u;
         WGThread *mt = &engine->scheduler->threads[0];
         mt->state = WG_THREAD_RUNNING;
         mt->id = 1;
