@@ -7372,6 +7372,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (args[4]) wg_blink_write_mem(engine->blink, args[4], &zero, 4);
             if (args[5]) wg_blink_write_mem(engine->blink, args[5], &zero, 4);
             ret_val = 1;
+        } else if (strcmp(fn, "SHGetKnownFolderPath") == 0) {
+            // SHGetKnownFolderPath(rfid=args64[0], dwFlags, hToken, ppszPath=args64[3]).
+            // Unlike SHGetFolderPathW, this ALLOCATES the wide path string (normally via
+            // CoTaskMemAlloc) and stores its pointer in *ppszPath. UE4 leans on this for
+            // its Documents/Saved/AppData config dirs; a null path -> deref crash.
+            const char *path = "C:\\users\\steamuser\\Documents";
+            uint16_t w[260]; int i = 0;
+            for (; path[i] && i < 259; i++) w[i] = (uint8_t)path[i];
+            w[i] = 0;
+            uint64_t gstr = wg_guest_alloc(engine, (i + 1) * 2);
+            if (gstr) wg_blink_write_mem(engine->blink, gstr, w, (i + 1) * 2);
+            if (args64[3]) wg_blink_write_mem(engine->blink, args64[3], &gstr, 8);
+            ret_val = 0; // S_OK
         } else if (strcmp(fn, "SHGetFolderPathW") == 0) {
             // SHGetFolderPathW(hwnd, csidl=args[1], hToken, dwFlags, pszPath=args[4]).
             // MUST write a valid path; otherwise NSIS reuses a stale buffer as
