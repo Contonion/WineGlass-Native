@@ -7962,7 +7962,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // the open below finds a valid cached manifest.
             if (real && strstr(apath, "steam_client_win32.manifest"))
                 wg_try_native_manifest_fetch(real);
-            if (real) {
+            struct stat dst;
+            size_t alen = strlen(apath);
+            bool want_dir = (args[5] & 0x02000000u)   // FILE_FLAG_BACKUP_SEMANTICS
+                          || (real && stat(real, &dst) == 0 && S_ISDIR(dst.st_mode))
+                          || strstr(apath, "/../") || strstr(apath, "\\..\\")
+                          || (alen && (apath[alen-1] == '/' || apath[alen-1] == '\\'));
+            if (want_dir) {
+                // UE4 opens DIRECTORIES via CreateFileW+FILE_FLAG_BACKUP_SEMANTICS
+                // (e.g. "C:/" for the file system / watcher). fopen fails on a dir, so
+                // return a valid fake handle rather than INVALID_HANDLE_VALUE(-1) —
+                // UE4 stores that -1 as a pointer and derefs it (singleton crash).
+                static uint32_t s_dir_h = 0x00000D00;
+                ret_val = s_dir_h; s_dir_h += 4; if (s_dir_h > 0xDF0) s_dir_h = 0x00000D00;
+            } else if (real) {
                 ret_val = wg_files_create(real, args[1], args[4]);
             } else {
                 ret_val = 0xFFFFFFFF;
