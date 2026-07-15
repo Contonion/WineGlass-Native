@@ -42,6 +42,12 @@ extern FILE* ftrace;
 extern uintptr_t box64_pagesize;
 extern int box64_unittest_mode;
 
+// Blink JIT instrumentation symbols the engine reads (for logging). box64 doesn't
+// produce these; define them as inert no-ops so the engine links against box64.
+unsigned long long wg_lockcas_total = 0, wg_lockcas_acq = 0;
+unsigned long long wg_cx16_total = 0, wg_cx16_ok = 0, wg_store_total = 0;
+void (*wg_spinlock_acquire_hook)(unsigned long long, unsigned long long) = 0;
+
 // ---- demand-paged identity memory -----------------------------------------
 // A hash set of mapped 64 KiB chunk ids (addr>>16). New chunks are mmap'd at their
 // own VA. Fixed-capacity open addressing; 1<<21 slots supports ~2M chunks (128 GiB).
