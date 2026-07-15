@@ -2019,20 +2019,24 @@ static void wg_guest_free64(uint64_t addr) {
 }
 // Reserve address space only (NO backing map) — a MEM_RESERVE, so a multi-GB
 // reservation costs nothing until pages are committed. Reuses a reclaimed block first.
-static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align) {
+static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align, uint64_t *out_commit) {
     if (size == 0) size = 1;
     if (align < 0x1000ULL) align = 0x1000ULL;
     uint64_t real = 0;
     uint64_t reuse = wg_free_take64_r((size + 0xFFFULL) & ~0xFFFULL, &real);
     // Track the REAL block size (>= requested) so the whole block returns on free.
-    if (reuse) { wg_track_alloc64(reuse, real); return reuse; }
+    // The caller must COMMIT/zero the WHOLE real block, not just the requested size:
+    // a larger reused block left an uncommitted, stale-data tail that later corrupted
+    // FMallocBinned2 canaries ("Corruption Canary was 0x0") deep in the drain.
+    if (reuse) { wg_track_alloc64(reuse, real); if (out_commit) *out_commit = real; return reuse; }
     s_heap64_ptr = (s_heap64_ptr + (align - 1)) & ~(align - 1);
     uint64_t addr = s_heap64_ptr;
     uint64_t alloc = (size + 0xFFFULL) & ~0xFFFULL;
-    if (addr + alloc > WG_HEAP64_END) return 0;   // region 3 full (won't fit the 8GB map)
+    if (addr + alloc > WG_HEAP64_END) return 0;   // region 3 full (won't fit the map)
     s_heap64_ptr += alloc;
     s_heap64_ptr = (s_heap64_ptr + 0xFFFULL) & ~0xFFFULL;
     wg_track_alloc64(addr, size);
+    if (out_commit) *out_commit = size;
     return addr;
 }
 // Region-3 commit bitmap: 1 bit per 4KB page over [WG_HEAP64_BASE, WG_HEAP64_END).
@@ -6092,9 +6096,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // a full UE4 asset load doesn't OOM. Reserve is address-space-only (cheap);
                 // only MEM_COMMIT backs pages. Its pointers flow through the args64-aware
                 // mem handlers. Falls back to the 32-bit heap if region 3 is full.
-                uint64_t a = wg_guest_reserve64(va_size, 0x10000);
+                uint64_t commit_sz = va_size;
+                uint64_t a = wg_guest_reserve64(va_size, 0x10000, &commit_sz);
                 int mapped = 1;
-                if (a && (va_type & 0x1000)) { mapped = wg_guest_map64(engine, a, va_size); if (!mapped) a = 0; }
+                // Zero the WHOLE reused block (commit_sz>=va_size) so no stale tail
+                // corrupts FMallocBinned2 later; the commit bitmap makes re-zeroing
+                // already-committed pages a no-op, so this is cheap on fresh blocks.
+                if (a && (va_type & 0x1000)) { mapped = wg_guest_map64(engine, a, commit_sz); if (!mapped) a = 0; }
                 if (!a) WG_LOGW(TAG, "region3 FAIL size=%llu reserve=%s heap64_ptr=0x%llX free64=%d live=%d dropped=%llu",
                                 (unsigned long long)va_size, mapped ? "0(full)" : "map-failed",
                                 (unsigned long long)s_heap64_ptr, s_free64_n, s_alloc64_n,
