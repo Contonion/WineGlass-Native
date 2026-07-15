@@ -2063,6 +2063,12 @@ static void wg_guest_free64(uint64_t addr) {
 static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align, uint64_t *out_commit) {
     if (size == 0) size = 1;
     if (align < 0x1000ULL) align = 0x1000ULL;
+    // box64: the region-3 base 0x1_0000_0000 collides with box64's own custommem
+    // reservation (and Apple reserves 0x2_0000_0000..0x4_0000_0000). Move VirtualAlloc's
+    // 64-bit heap to the proven-free 0x100_0000_0000 (1TB) window, clear of the
+    // wg_guest_alloc heap at 0x80_0000_0000.
+    if (wg_cpu_is_box64() && s_heap64_ptr == WG_HEAP64_BASE)
+        s_heap64_ptr = 0x10000000000ULL;
     uint64_t real = 0;
     uint64_t reuse = wg_free_take64_r((size + 0xFFFULL) & ~0xFFFULL, &real);
     // Track the REAL block size (>= requested) so the whole block returns on free.
@@ -2073,7 +2079,8 @@ static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align, uint64_t *out_
     s_heap64_ptr = (s_heap64_ptr + (align - 1)) & ~(align - 1);
     uint64_t addr = s_heap64_ptr;
     uint64_t alloc = (size + 0xFFFULL) & ~0xFFFULL;
-    if (addr + alloc > WG_HEAP64_END) return 0;   // region 3 full (won't fit the map)
+    uint64_t heap_end = wg_cpu_is_box64() ? 0x20000000000ULL : WG_HEAP64_END;
+    if (addr + alloc > heap_end) return 0;   // region 3 full (won't fit the map)
     s_heap64_ptr += alloc;
     s_heap64_ptr = (s_heap64_ptr + 0xFFFULL) & ~0xFFFULL;
     wg_track_alloc64(addr, size);
@@ -2949,6 +2956,19 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
     #define A0 args[0]
     #define A1 args[1]
     #define A2 args[2]
+    // DIAG: log the CRT "fatal path" functions + their caller so we can pin the ctor
+    // that aborts/throws (STATUS_FATAL_APP_EXIT during _initterm). Logs, doesn't handle.
+    if (getenv("WG_DIAG_FATAL") && (
+            !strcmp(fn,"abort")||!strcmp(fn,"terminate")||!strcmp(fn,"__std_terminate")||
+            !strcmp(fn,"_CxxThrowException")||!strcmp(fn,"RaiseException")||
+            !strcmp(fn,"RaiseFailFastException")||!strcmp(fn,"_invalid_parameter")||
+            !strcmp(fn,"_invalid_parameter_noinfo")||!strcmp(fn,"_invalid_parameter_noinfo_noreturn")||
+            !strcmp(fn,"_purecall")||!strcmp(fn,"__acrt_initialize")||!strcmp(fn,"_errno"))) {
+        uint64_t rsp = wg_blink_get_reg(engine->blink, 4), rr = 0;
+        wg_blink_read_mem(engine->blink, rsp, &rr, 8);
+        WG_LOGW(TAG, "★ FATAL-PATH %s ret=0x%llX a0=0x%llX a1=0x%llX", fn,
+                (unsigned long long)rr, (unsigned long long)args64[0], (unsigned long long)args64[1]);
+    }
     // wcsstr — ESSENTIAL for UE4 config init (path `/..` collapse + config token
     // substitution {ENGINE}/{PROJECT}/{PLATFORM}/{USER}...). Auto-stubbed it never
     // found anything, so config init looped forever and the boot never reached the
@@ -3226,9 +3246,51 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
     // emulates SSE/SSE2/SSE3/etc. The MSVC CRT's __isa_available_init checks these;
     // returning 0 for a feature it treats as mandatory sends it into the fatal path.
     if (!strcmp(fn,"IsProcessorFeaturePresent")) { *ret = 1; return true; }
+    // RtlCaptureContext(CONTEXT* Ctx): fill the guest CONTEXT with the CALLER's
+    // register state. __scrt_common_main_seh captures its own context here for the
+    // top-level __try frame; a no-op stub leaves Ctx zeroed (Rip=0) and the CRT then
+    // walks a garbage context -> crash at 0. x64 CONTEXT field offsets (winnt.h).
+    if (!strcmp(fn,"RtlCaptureContext")) {
+        void *bl = engine->blink;
+        uint64_t ctx = args64[0];
+        uint64_t rsp = wg_blink_get_reg(bl, 4);            // RSP at the call
+        uint64_t retrip = 0; wg_blink_read_mem(bl, rsp, &retrip, 8);  // pushed return addr
+        uint64_t after = rsp + 8;                          // RSP as if RtlCaptureContext returned
+        uint32_t cflags = 0x0010000BU;                     // CONTEXT_FULL (AMD64)
+        wg_blink_write_mem(bl, ctx + 0x30, &cflags, 4);
+        static const struct { uint32_t off; int reg; } G[] = {
+            {0x78,0},{0x80,1},{0x88,2},{0x90,3},{0xA0,5},{0xA8,6},{0xB0,7},
+            {0xB8,8},{0xC0,9},{0xC8,10},{0xD0,11},{0xD8,12},{0xE0,13},{0xE8,14},{0xF0,15},
+        };
+        for (unsigned i = 0; i < sizeof(G)/sizeof(G[0]); i++) {
+            uint64_t v = wg_blink_get_reg(bl, G[i].reg);
+            wg_blink_write_mem(bl, ctx + G[i].off, &v, 8);
+        }
+        wg_blink_write_mem(bl, ctx + 0x98, &after, 8);     // Rsp
+        wg_blink_write_mem(bl, ctx + 0xF8, &retrip, 8);    // Rip = return address
+        uint32_t ef = (uint32_t)wg_blink_get_flags(bl);
+        wg_blink_write_mem(bl, ctx + 0x44, &ef, 4);        // EFlags
+        *ret = 0; return true;
+    }
     // Minimal x64 SEH: no per-function unwind info -> the unwinder treats frames as
     // leaves and stops cleanly instead of walking a zeroed/garbage context.
     if (!strcmp(fn,"RtlLookupFunctionEntry")) { *ret = 0; return true; }
+    // Decode the exception so we can fix the ROOT cause (what a ctor did wrong).
+    // EXCEPTION_POINTERS{ EXCEPTION_RECORD* (0), CONTEXT* (8) };
+    // EXCEPTION_RECORD{ code(0), flags(4), rec(8), Address(0x10), nParams(0x18), Info[](0x20) }.
+    if (!strcmp(fn,"UnhandledExceptionFilter")) {
+        void *bl = engine->blink;
+        uint64_t ep = args64[0], er = 0;
+        wg_blink_read_mem(bl, ep, &er, 8);
+        uint32_t code = 0; uint64_t addr = 0, i0 = 0, i1 = 0;
+        wg_blink_read_mem(bl, er + 0x00, &code, 4);
+        wg_blink_read_mem(bl, er + 0x10, &addr, 8);
+        wg_blink_read_mem(bl, er + 0x20, &i0, 8);
+        wg_blink_read_mem(bl, er + 0x28, &i1, 8);
+        WG_LOGW(TAG, "★ UnhandledException code=0x%08X at RIP=0x%llX (info[0]=%llu info[1]=0x%llX)",
+                code, (unsigned long long)addr, (unsigned long long)i0, (unsigned long long)i1);
+        *ret = 0; return true;   // EXCEPTION_CONTINUE_SEARCH
+    }
 
     // ---- CRT startup / onexit (return "success"; we don't run atexit at teardown) ----
     if (!strcmp(fn,"_configure_narrow_argv")) { *ret=0; return true; }
@@ -3981,14 +4043,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // For 64-bit (Microsoft x64): RCX, RDX, R8, R9, then stack args after the
     // return address + 32-byte shadow space. Truncating to 32 bits is safe:
     // 64-bit images are rebased below 4GB and stack/heap/thunks all sit there.
-    uint32_t args[16] = {0};
-    // Full 64-bit args (parallel to the 32-bit `args`). Handlers that take guest
-    // POINTERS must use args64 so they work with the 64-bit VirtualAlloc heap
-    // (>4GB) — reading the pointer as 32-bit `args[i]` truncates it to garbage.
-    uint64_t args64[16] = {0};
+    // args[] holds the FULL 64-bit argument values (was uint32_t, which truncated
+    // guest pointers to garbage on the box64 path where the image/heap live >4GB).
+    // 32-bit-PE values are zero-extended, so blink (all addresses <4GB) is unchanged;
+    // box64 gets correct full-width pointers in every handler that reads args[i].
+    uint64_t args[16] = {0};
+    uint64_t args64[16] = {0};   // kept as an alias for handlers that already use it
     if (is_32bit) {
-        wg_blink_read_mem(engine->blink, rsp + 4, args, sizeof(args));
-        for (int i = 0; i < 16; i++) args64[i] = args[i];
+        uint32_t a32[16] = {0};
+        wg_blink_read_mem(engine->blink, rsp + 4, a32, sizeof(a32));
+        for (int i = 0; i < 16; i++) { args[i] = a32[i]; args64[i] = a32[i]; }
     } else {
         args64[0] = wg_blink_get_reg(engine->blink, 1);  // RCX
         args64[1] = wg_blink_get_reg(engine->blink, 2);  // RDX
@@ -3997,7 +4061,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
         uint64_t stack_args[12] = {0};
         wg_blink_read_mem(engine->blink, rsp + 8 + 32, stack_args, sizeof(stack_args));
         for (int i = 0; i < 12; i++) args64[4 + i] = stack_args[i];
-        for (int i = 0; i < 16; i++) args[i] = (uint32_t)args64[i];
+        for (int i = 0; i < 16; i++) args[i] = args64[i];   // full 64-bit
     }
 
     // Default return value: the registered stub's intent (R1S->1, etc.). The
@@ -4736,12 +4800,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
         } else if (strcmp(fn, "GetModuleHandleW") == 0) {
-            uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
-            if (args[0] == 0) {
+            // 64-bit: the module-name pointer and the returned HMODULE (image base)
+            // must be full width — box64 keeps the image at 0x140000000, so a
+            // uint32 truncation makes the name read from unmapped low memory and the
+            // CRT's FLS init __fastfail when GetModuleHandleW(name) "returns 0".
+            uint64_t base = engine->pe_image ? engine->pe_image->image_base : 0x400000;
+            if (args64[0] == 0) {
                 ret_val = base;
             } else {
                 uint16_t modname[256] = {0};
-                wg_blink_read_mem(engine->blink, args[0], modname, 510);
+                wg_blink_read_mem(engine->blink, args64[0], modname, 510);
                 char ascii[256] = {0};
                 for (int i = 0; i < 255 && modname[i]; i++)
                     ascii[i] = modname[i] < 128 ? (char)modname[i] : '?';
@@ -5107,6 +5175,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // when a constructor mis-executes under blink and aborts startup.
             uint64_t it_first = wg_blink_get_reg(engine->blink, 1);
             uint64_t it_last  = wg_blink_get_reg(engine->blink, 2);
+            // DIAG: log the initializer pointers, and optionally clamp how many run
+            // (WG_INITTERM_MAX=N) to bisect which one aborts.
+            {
+                uint64_t n = (it_last - it_first) / 8;
+                for (uint64_t k = 0; k < n && k < 32; k++) {
+                    uint64_t p = 0; wg_blink_read_mem(engine->blink, it_first + k*8, &p, 8);
+                    WG_LOGI(TAG, "  init[%llu] = 0x%llX", (unsigned long long)k, (unsigned long long)p);
+                }
+                const char *mx = getenv("WG_INITTERM_MAX");
+                if (mx) {
+                    uint64_t m = strtoull(mx, 0, 10);
+                    if (m < n) { it_last = it_first + m*8; wg_blink_set_reg(engine->blink, 2, it_last); }
+                }
+            }
             static int skip_initterm = -1;
             if (skip_initterm < 0) {
                 const char *e = getenv("WG_SKIP_INITTERM");

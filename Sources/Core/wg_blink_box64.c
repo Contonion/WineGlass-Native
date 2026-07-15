@@ -115,6 +115,18 @@ static x64emu_t* volatile s_run_emu = NULL;   // emu currently in Run(), for the
 
 static void wg_box64_segv(int sig, siginfo_t* si, void* uc) {
     (void)uc;
+    // Demand-paging: box64 executes guest loads/stores DIRECTLY on the host, so a
+    // guest access to an as-yet-unmapped high address faults here. Map the 64 KiB
+    // chunk and RESUME (retry the instruction) — true lazy paging for the box64
+    // identity heap (VirtualAlloc reserves >4GB regions the guest then touches).
+    uint64_t fa = (uint64_t)(uintptr_t)(si ? si->si_addr : 0);
+    if (fa >= WG_LOW_LIMIT) {
+        uint64_t chunk = fa >> WG_CHUNK_SHIFT;
+        void* base = (void*)(uintptr_t)(chunk << WG_CHUNK_SHIFT);
+        void* got = mmap(base, WG_CHUNK_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (got == base) { ht_has_or_add(chunk); return; }   // mapped -> resume
+    }
     x64emu_t* e = s_run_emu;
     fprintf(stderr, "[box64] SIG%d fault@%p  guest RIP=0x%llx RSP=0x%llx RAX=0x%llx RCX=0x%llx\n",
             sig, si ? si->si_addr : 0,
