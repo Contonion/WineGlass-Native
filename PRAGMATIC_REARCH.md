@@ -1,5 +1,22 @@
 # WineGlass — Pragmatic Re-Architecture (translator + native Win32 + Wine DLLs)
 
+## 🎯 THE DIRECTIVE (do not forget)
+> **Swap blink out for box64. Get Visage BOOTING — at all costs.** Use WineGlass's existing
+> Win32 API/thunk layer, and pull in whatever we need from **Wine** to help/speed it up.
+> Public GitHub fork for this work. Positive attitude, no stopping until it runs.
+> Endgame: **Visage on iOS via a TRANSLATOR (box64), not an emulator (blink).** Download any
+> files needed to make this happen.
+
+**Concrete order of battle:**
+1. [x] Public repo `Contonion/WineGlass-Native`, box64 vendored (submodule).
+2. [ ] Build box64 on macOS arm64 (or its DynaRec in isolation) — see what off-Linux needs.
+3. [ ] `wg_cpu.h` backend interface (mirror WGBlinkVM_*); make blink + box64 swappable.
+4. [ ] Wrap box64's ARM64 DynaRec as `wg_cpu_box64`; route its call-outs → our Win32 thunks.
+5. [ ] Boot a trivial PE, then Visage, on `Tests/build_mac_window.sh` (D3D11→Metal path).
+6. [ ] Pull Wine sources for reference/DLLs where our Win32 coverage is thin.
+7. [ ] Keep every decision iOS-JIT (StikDebug) compatible.
+
+
 ## Goal
 Replace **blink** (interpreter, with a basic JIT) with a **mature x86-64→ARM64 translator**
 (**box64** first, FEX-emu as an alternative), keep WineGlass's **existing iOS-native Win32
