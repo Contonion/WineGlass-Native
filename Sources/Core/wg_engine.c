@@ -3222,6 +3222,14 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
         *ret = slot; return true;
     }
 
+    // IsProcessorFeaturePresent: claim common x86-64 features ARE present — box64
+    // emulates SSE/SSE2/SSE3/etc. The MSVC CRT's __isa_available_init checks these;
+    // returning 0 for a feature it treats as mandatory sends it into the fatal path.
+    if (!strcmp(fn,"IsProcessorFeaturePresent")) { *ret = 1; return true; }
+    // Minimal x64 SEH: no per-function unwind info -> the unwinder treats frames as
+    // leaves and stops cleanly instead of walking a zeroed/garbage context.
+    if (!strcmp(fn,"RtlLookupFunctionEntry")) { *ret = 0; return true; }
+
     // ---- CRT startup / onexit (return "success"; we don't run atexit at teardown) ----
     if (!strcmp(fn,"_configure_narrow_argv")) { *ret=0; return true; }
     if (!strcmp(fn,"_configure_wide_argv"))   { *ret=0; return true; }
