@@ -9,12 +9,82 @@
 
 **Concrete order of battle:**
 1. [x] Public repo `Contonion/WineGlass-Native`, box64 vendored (submodule).
-2. [ ] Build box64 on macOS arm64 (or its DynaRec in isolation) — see what off-Linux needs.
-3. [ ] `wg_cpu.h` backend interface (mirror WGBlinkVM_*); make blink + box64 swappable.
-4. [ ] Wrap box64's ARM64 DynaRec as `wg_cpu_box64`; route its call-outs → our Win32 thunks.
-5. [ ] Boot a trivial PE, then Visage, on `Tests/build_mac_window.sh` (D3D11→Metal path).
+2. [x] Build box64 on macOS arm64 — **DONE / proven portable.** box64's emu + ARM64
+   DynaRec compile 100% clean on Apple/clang (the iOS toolchain). Only the Linux
+   OS-integration layer (ELF loader, wrapped .so libs, Linux syscalls/threads/signals)
+   fails — exactly the parts WineGlass replaces with its PE loader + Win32 thunks.
+   macOS port shims (all in Vendor/box64, downstream fork):
+     - flags: `-D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE -Dsincos=__sincos`
+     - `os.h`: JUMPBUFF → sigjmp_buf (Android-style) on __APPLE__
+     - vendored `src/include/elf.h` (musl, macOS has none)
+     - `arm64_asm.h` CNAME + @PAGE/@PAGEOFF; ported all 4 arm64 .S to Mach-O
+     - `arm64_printer.c` uintptr_t/uint64_t (Mach-O distinct types)
+     - `dynarec_arm64_arch.c` adjust_arch: macOS mcontext stub (TODO: real port)
+     - `core.c` prctl→pthread_setname_np; new `src/os/os_macos.c` (Darwin backend)
+     - `debug.h` allocator: box_calloc→libc on __APPLE__ (no glibc __libc_*)
+   Spike harness `Vendor/box64/box64_spike.c`: drives NewBox64Context + NewX64Emu +
+   interpreter Run (BOX64_DYNAREC=0, no JIT/PROT_EXEC needed) on our own mmap'd guest
+   memory (identity-mapped above macOS 4GB __PAGEZERO). Links vs a libbox64all.a of the
+   clean core objects + spike_stubs.c (zero-stubs for the unused ELF/librarian layer).
+3. [x] `wg_cpu.h` backend interface — **DONE.** Backend-neutral vtable API (Sources/Core/
+   wg_cpu.h/.c) with blink adapter (wg_cpu_blink.c, wraps existing wg_blink_*) and box64
+   backend (wg_cpu_box64.c, real box64 API — struct accesses validated). Selectable via
+   `WG_CPU=box64` or wg_cpu_use(). PROVEN: a driver using ONLY wg_cpu_* drove box64 to
+   run mov/imul/add/dec → RAX=66. blink path untouched (zero engine call-site churn yet).
+4. [~] Wrap box64's DynaRec as `wg_cpu_box64` (create/run/regs/mem DONE) + route its
+   call-outs → our Win32 thunks. **Interception SEAM PROVEN** (box64_bridge_spike.c): guest
+   CALL → box64 bridge → our C wrapper (reads Win64-ABI args from emu, returns via RAX) →
+   RAX=43 ✅. Enter guest via DynaCall(emu, rip, 0); Win32 handled INLINE (no halt-dispatch).
+   REMAINING: register every WineGlass Win32 import as a bridge with a generic wrapper that
+   routes to our existing handlers, and wire into the engine (tasks #35-37).
+5. [~] Boot a trivial PE, then Visage, on the mac harness. **Full engine now BUILDS +
+   LINKS on box64** (Tests/build_mac_window_box64.sh, 6MB binary, box64 symbols confirmed,
+   pagezero shrunk). BLOCKER to a real boot = the address-space relocation below.
 6. [ ] Pull Wine sources for reference/DLLs where our Win32 coverage is thin.
 7. [ ] Keep every decision iOS-JIT (StikDebug) compatible.
+
+## ⛔ THE REMAINING BLOCKER: relocate the guest address space above 4 GB (for box64)
+box64 is IDENTITY-mapped (guest VA == host VA). **Apple Silicon reserves the low 4 GB**
+(mmap MAP_FIXED at 0xDEAD0000 gets SIGKILL'd even with -pagezero_size 0x4000 — proven).
+So for box64, EVERY fixed guest address must live above 4 GB. But WineGlass's engine is
+**32-bit-centric** even in 64-bit mode (legacy of the Steam/32-bit origin):
+- `WG_THUNK_BASE = 0xDEAD0000` (wg_dll_mapper.h) — below 4 GB, and stored/compared as
+  `uint32_t` (s_heap_ptr is uint32_t; next_thunk; casts at wg_engine.c:1877/8265, 3728).
+- 32-bit PEs load at image base 0x400000 with stacks/heaps < 2 GB — **fundamentally can't**
+  use box64 identity on Apple Silicon (low 4 GB reserved). So box64 targets **64-bit PEs
+  only** on Apple hw (Visage is 64-bit — fine; 32-bit Steam etc. would need a different path).
+- 64-bit path: image base must be high (0x140000000 ok); WG_HEAP64_BASE=0x100000000 ok;
+  thunks + any uint32_t address state must move above 4 GB.
+
+**Plan (do WITH the game + device iteration — invasive, risks the working blink path):**
+  a. Gate a box64 build flag (WG_CPU_BOX64). Under it, set WG_THUNK_BASE to a high value
+     (e.g. 0x2_DEAD_0000, above WG_HEAP64_END=0x2800000000) and widen s_heap_ptr / next_thunk
+     / thunk compares from uint32_t to uint64_t on the 64-bit path.
+  b. Ensure the PE loader rebases the 64-bit image to a high base (≥0x140000000) with relocs,
+     and TEB/PEB/stack allocate above 4 GB.
+  c. DynaRec JIT: bridge NewBrick + the dynablock code cache to MAP_JIT + pthread_jit_write_
+     protect_np (WineGlass already has this for blink). Interpreter path (BOX64_DYNAREC=0)
+     works today and is enough for first boot.
+  d. Boot WGTest-class 64-bit PE (build a minimal one), then Visage; debug to the menu.
+
+## ✅ PROVEN (all on the mac harness — see memory/box64-pivot.md)
+1. box64 emu+DynaRec compile clean on Apple/clang (only Linux OS-layer fails — we replace it).
+2. Execution spike: box64 ran mov/imul/add/dec → RAX=66 via our own harness (no ELF loader).
+3. wg_cpu backend interface: a driver using only wg_cpu_* drove box64 → RAX=66.
+4. Interception: box64 bridge → our C handler → RAX=43; AND box64 drives WineGlass's own
+   HLT-thunk model (wg_blink_box64.c) → dispatch → RAX=43. Zero engine call-site changes.
+5. Full WineGlass engine builds + links on box64 (Tests/build_mac_window_box64.sh).
+
+**Key model facts learned (for the wg_cpu_box64 wiring):**
+- Registers: `emu->regs[16]` (idx `_AX=0,_CX,_DX,_BX,_SP,_BP,_SI,_DI,_R8..R15`), `emu->ip`,
+  `emu->xmm[16]`, `emu->eflags`. Accessors `R_RAX`/`R_RIP`/`R_RSP` (reg.q is a `[1]` array).
+- Entry: `Run(emu,step)` = interpreter (step≠0 single-steps); `DynaRun(emu)`/`DynaCall(emu,addr,0)`
+  = JIT, falls back to interpreter when `BOX64_DYNAREC=0`. Terminates on `emu->quit`; a
+  guest `RET` to `my_context->exit_bridge` ends a `DynaCall`. `PushExit(emu)` sets that up.
+- **Memory is IDENTITY-mapped** (guest VA == host VA), MAP_FIXED at guest addresses — like
+  Path B without the skew. On macOS/iOS guest mem must live above the 4GB `__PAGEZERO`
+  (Win64 image base 0x140000000 already does). DynaRec code cache needs MAP_JIT + W^X on
+  Apple (the StikDebug path WineGlass already has for blink) — spike sidesteps via interpreter.
 
 
 ## Goal
