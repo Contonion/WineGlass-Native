@@ -1021,9 +1021,12 @@ static struct { uint8_t used; uint32_t file_handle; } s_filemap[WG_MAX_FILEMAP];
 // reads 0 for an unset slot and the CRT lazily allocates its own block.
 // Indexed by scheduler thread slot (WG_MAX_THREADS rows). Windows guarantees
 // at least 1088 TLS slots.
-static uint32_t s_tls_slots[WG_MAX_THREADS][1088] = {{0}};
+// 64-bit slot values: TLS/FLS hold LPVOID (guest pointers). On the box64 path those
+// are >4GB (e.g. FMallocBinned2's per-thread pool at region-3), so a uint32 slot
+// truncated the pointer -> the allocator read a low unmapped alias and crashed.
+static uint64_t s_tls_slots[WG_MAX_THREADS][1088] = {{0}};
 static uint32_t s_tls_next = 0;
-static uint32_t s_fls_slots[WG_MAX_THREADS][1088] = {{0}};   // Fiber-Local Storage
+static uint64_t s_fls_slots[WG_MAX_THREADS][1088] = {{0}};   // Fiber-Local Storage
 static uint32_t s_fls_next = 0;
 
 // Fake event/mutex/semaphore handles. Single-threaded, so events are just

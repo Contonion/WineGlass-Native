@@ -134,6 +134,21 @@ static void wg_box64_segv(int sig, siginfo_t* si, void* uc) {
             e ? (unsigned long long)e->regs[_SP].q[0] : 0,
             e ? (unsigned long long)e->regs[_AX].q[0] : 0,
             e ? (unsigned long long)e->regs[_CX].q[0] : 0);
+    if (e) {
+        fprintf(stderr, "[box64]   R8=0x%llx R9=0x%llx R15=0x%llx RBX=0x%llx RDI=0x%llx\n",
+                (unsigned long long)e->regs[_R8].q[0], (unsigned long long)e->regs[_R9].q[0],
+                (unsigned long long)e->regs[_R15].q[0], (unsigned long long)e->regs[_BX].q[0],
+                (unsigned long long)e->regs[_DI].q[0]);
+        // guest-stack return-address trace (image-range only) to find the call chain
+        uint64_t rsp = e->regs[_SP].q[0];
+        fprintf(stderr, "[box64]   guest stack .text returns:");
+        for (int i = 0; i < 40; i++) {
+            uint64_t v = *(uint64_t*)(uintptr_t)(rsp + i*8);
+            if (v >= 0x140000000ULL && v < 0x145000000ULL)
+                fprintf(stderr, " 0x%llx", (unsigned long long)v);
+        }
+        fprintf(stderr, "\n");
+    }
     _exit(139);
 }
 
