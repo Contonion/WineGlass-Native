@@ -3941,6 +3941,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
         // needle the game keeps searching for in the asset-scan loop, once per unique
         // needle string, to identify what it's looking for and never finding.
         if (!strcmp(fn, "wcsstr")) {
+            // PROGRESS PROBE: every 500k wcsstr calls, dump the current haystack so we
+            // can tell if reflection registration ADVANCES through modules (new names =
+            // slow-but-finite) or is STUCK re-processing one (cycle = never completes).
+            static unsigned long long s_wcn = 0;
+            if ((++s_wcn % 500000ULL) == 0) {
+                uint16_t hw[96]; wg_read_wstr(engine, args64[0], hw, 96);
+                char hb[96]; int k = 0; for (; k < 95 && hw[k]; k++) hb[k] = (char)(hw[k] < 128 ? hw[k] : '?'); hb[k] = 0;
+                WG_LOGW(TAG, "PROGRESS wcsstr#%lluM haystack=\"%s\"", s_wcn / 1000000ULL, hb);
+            }
             // Track needle usage counts; log the HOT needle (the O(N^2) drain lookup)
             // once, with its string + haystack, to identify what it rescans forever.
             static uint64_t s_nd[128]; static uint32_t s_ndc[128]; static uint8_t s_ndl_logged[128]; static int s_ndn = 0;
