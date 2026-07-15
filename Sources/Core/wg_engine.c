@@ -1978,7 +1978,13 @@ static uint64_t wg_free_take64_r(uint64_t size, uint64_t *out_real) {
             return a;
         }
     }
-    for (;;) {                                       // best-fit WHOLE block
+    // EXACT-only (no best-fit whole-block): whole-block reuse handed a larger block
+    // for a smaller request and, deep in the drain, corrupted FMallocBinned2 canaries
+    // ("Corruption Canary was 0x0") — a subtle interaction with the commit bitmap /
+    // FMallocBinned2's pool caching. Exact-only never corrupts (proven), and with the
+    // 160GB window there's room for the game's ~92GB live reserves, so we can afford
+    // it. WG_WHOLEBLOCK re-enables best-fit for experiments.
+    if (getenv("WG_WHOLEBLOCK")) for (;;) {          // best-fit WHOLE block (opt-in)
         int best = -1;
         for (int i = 0; i < s_free64_n; i++)
             if (s_free64[i].size >= want && (best < 0 || s_free64[i].size < s_free64[best].size)) best = i;
@@ -1989,6 +1995,7 @@ static uint64_t wg_free_take64_r(uint64_t size, uint64_t *out_real) {
         s_free64[best] = s_free64[--s_free64_n];
         return a;
     }
+    return 0;
 }
 static void wg_guest_free64(uint64_t addr) {
     if (addr < WG_HEAP64_BASE) return;
