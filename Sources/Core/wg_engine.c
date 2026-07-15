@@ -3505,7 +3505,21 @@ static bool handle_blink_thunk(WGEngine *engine) {
             const unsigned long long BREAK_AFTER = 200000ULL;
             uint8_t rg = s_loops[li].reg, of = s_loops[li].off;
             uint64_t cur = wg_blink_get_reg(engine->blink, rg);   // current node
-            uint64_t nxt = 0; wg_blink_read_mem(engine->blink, (uint32_t)(cur + of), &nxt, 8);
+            // 64-bit address: the UField nodes live in region-3 (>4GB) buffers, so
+            // truncating cur+of read the wrong Next and (when armed) corrupted the walk.
+            uint64_t nxt = 0; wg_blink_read_mem(engine->blink, cur + of, &nxt, 8);
+            // CYCLE PROBE: keep a ring of recent nodes; if cur revisits one, it's a cycle
+            // (not a self-loop, which the check below catches). Log periodically + on a
+            // detected revisit so we can tell advancing (finite) from cyclic (hangs).
+            static uint64_t s_ring[512]; static int s_ringn = 0; static unsigned long long s_fires = 0, s_revisits = 0;
+            s_fires++;
+            int revisit = 0; for (int r = 0; r < s_ringn; r++) if (s_ring[r] == cur) { revisit = 1; break; }
+            if (revisit) s_revisits++;
+            s_ring[s_ringn % 512] = cur; if (s_ringn < 1000000000) s_ringn++;
+            if ((s_fires % 200000ULL) == 0)
+                WG_LOGW(TAG, "LOOPWALK @0x%llX fire#%lluM cur=0x%llX nxt=0x%llX revisits=%llu(recent512)",
+                        (unsigned long long)rip, s_fires/1000000ULL, (unsigned long long)cur,
+                        (unsigned long long)nxt, (unsigned long long)s_revisits);
             if (nxt == cur && cur != 0 && cur == s_loop_last) s_loop_same++;
             else { s_loop_same = 0; s_loop_last = cur; }
             if (s_loop_same > BREAK_AFTER) {                       // genuinely stuck self-loop
@@ -3514,12 +3528,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // under emulation. Dump both + the node header so we can find the real bug
                 // instead of patching (which can drop objects -> missing CDOs).
                 uint64_t f20 = 0, f10 = 0, f00 = 0;
-                wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x20), &f20, 8);
-                wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x10), &f10, 8);
-                wg_blink_read_mem(engine->blink, (uint32_t)(cur + 0x00), &f00, 8);
+                wg_blink_read_mem(engine->blink, cur + 0x20, &f20, 8);
+                wg_blink_read_mem(engine->blink, cur + 0x10, &f10, 8);
+                wg_blink_read_mem(engine->blink, cur + 0x00, &f00, 8);
                 uint64_t rsi = wg_blink_get_reg(engine->blink, 6);
                 uint64_t zero = 0;
-                wg_blink_write_mem(engine->blink, (uint32_t)(cur + of), &zero, 8);
+                wg_blink_write_mem(engine->blink, cur + of, &zero, 8);
                 nxt = 0;
                 s_loop_same = 0;
                 if ((++s_loop_breaks % 1000ULL) == 1)
