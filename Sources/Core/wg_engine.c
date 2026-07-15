@@ -1275,6 +1275,24 @@ void wg_engine_destroy(WGEngine *engine) {
 // calls the Win32 stub handler before resuming.
 //
 
+// True when the box64 CPU backend is active (WG_CPU=box64). box64 is identity-mapped
+// and Apple Silicon reserves the low 4GB, so on this path all guest memory must live
+// above 4GB. blink (paged) is unaffected. Cached after first call.
+static bool wg_cpu_is_box64(void) {
+    static signed char s = -1;
+    if (s < 0) { const char *e = getenv("WG_CPU"); s = (e && (!strcmp(e,"box64")||!strcmp(e,"BOX64"))) ? 1 : 0; }
+    return s == 1;
+}
+
+// 64-bit HLT import-thunk base. blink maps it at 0xDEAD0000 (paged). box64 is
+// identity-mapped and Apple reserves the low 4GB (and box64 reserves ~0x2_0000_0000
+// ..0x4_0000_0000), so on the box64 path thunks live in the proven-free
+// 0x1_4000_0000..0x1_FFFF_FFFF window, above the image + warm-up.
+#define WG_THUNK_BASE_BOX64 0x170000000ULL
+static uint64_t wg_thunk_base64(void) {
+    return wg_cpu_is_box64() ? WG_THUNK_BASE_BOX64 : (uint64_t)WG_THUNK_BASE;
+}
+
 // Layout at each thunk address (8 bytes apart):
 //   [thunk+0] HLT   (0xF4) — stops execution
 // The engine sees the halt, checks if RIP is in the thunk range,
@@ -1283,9 +1301,9 @@ static void map_thunks_to_blink(WGEngine *engine) {
     if (!engine->blink || !engine->dll_mapper || engine->thunks_mapped) return;
 
     // For 32-bit PEs, thunks must be within 16MB (kRealSize).
-    // Use 0xC00000 (12MB mark) for 32-bit, WG_THUNK_BASE for 64-bit.
+    // Use 0xC00000 (12MB mark) for 32-bit, the 64-bit thunk base otherwise.
     bool is_32bit = (engine->pe_image && !engine->pe_image->is_64bit);
-    uint64_t thunk_base = is_32bit ? 0xC00000ULL : WG_THUNK_BASE;
+    uint64_t thunk_base = is_32bit ? 0xC00000ULL : wg_thunk_base64();
 
     // Reassign thunk addresses to the correct range
     engine->dll_mapper->next_thunk = thunk_base;
@@ -2358,11 +2376,13 @@ static bool wg_recover_ok(uint64_t ret_addr) {
 // right over them, so the scratch maps would clobber the game's own .text.
 // For such images these are relocated to a region ABOVE the image at load time
 // (see wg_place_scratch). 0 base = legacy layout.
-static uint32_t s_scratch_base = 0;
-static uint32_t s_cmdline_page = 0x00A00000u;   // GetCommandLineW/A page
+// 64-bit-wide so a rebased 64-bit image's scratch pages (just above the image, which
+// on the box64 path is at 0x140000000+) aren't truncated to a low, unmappable address.
+static uint64_t s_scratch_base = 0;
+static uint64_t s_cmdline_page = 0x00A00000u;   // GetCommandLineW/A page
 static char     s_cmdline_extra[128] = {0};     // switches appended to the guest cmdline
-static uint32_t s_tramp_addr   = 0x00C30000u;   // x64 _initterm trampoline
-static uint32_t s_gai_base     = 0x00B00000u;   // getaddrinfo result scratch (1MB)
+static uint64_t s_tramp_addr   = 0x00C30000u;   // x64 _initterm trampoline
+static uint64_t s_gai_base     = 0x00B00000u;   // getaddrinfo result scratch (1MB)
 
 // Collapse "." and ".." segments in a Windows path, in place (ASCII —
 // PathCanonicalize semantics, enough for the launcher-built exe paths).
@@ -3722,10 +3742,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
         return true;
     }
 
-    // Check both 32-bit (0xC00000) and 64-bit (0xDEAD0000) thunk ranges
+    // Check both 32-bit (0xC00000) and 64-bit (WG_THUNK_BASE / box64-relocated) ranges
     bool in_thunk_range = false;
+    uint64_t tb64 = wg_thunk_base64();
     if (rip >= 0xC00000ULL && rip < 0xC00000ULL + 0x20000) in_thunk_range = true;
-    if (rip >= WG_THUNK_BASE && rip < WG_THUNK_BASE + 0x20000) in_thunk_range = true;
+    if (rip >= tb64 && rip < tb64 + 0x20000) in_thunk_range = true;
     if (!in_thunk_range) return false;
  
     // SEH handler returned a disposition: advance the chain or resume.
@@ -8907,7 +8928,11 @@ static bool ensure_blink_vm(WGEngine *engine, bool is_64bit) {
     // faults; harmless in the software-MMU path but an uncaught host SIGSEGV
     // under linear memory / JIT). HLT cleanly returns WG_BLINK_HALT.
     uint8_t warmup[] = { 0x90, 0xF4 };
-    wg_blink_load_code(engine->blink, 0x3F0000, warmup, sizeof(warmup), 0x3F0000);
+    // box64 is identity-mapped and Apple Silicon reserves the low 4GB, so the
+    // throwaway warm-up code must live above 4GB there. blink (paged) keeps the
+    // proven low address. (Part of the WG_CPU=box64 guest-space-above-4GB path.)
+    uint64_t wu = wg_cpu_is_box64() ? 0x160000000ULL : 0x3F0000ULL;
+    wg_blink_load_code(engine->blink, wu, warmup, sizeof(warmup), wu);
     WGBlinkResult wr = wg_blink_run(engine->blink, 10);
     WG_LOGI(TAG, "Blink JIT warm-up: %s",
             wr == WG_BLINK_HALT ? "OK" : "absorbed first-run init");
@@ -9543,7 +9568,7 @@ static bool load_pe_blink(WGEngine *engine) {
         if (img_end > 0x00A00000ULL) {
             uint64_t b = (img_end + 0xFFFFFULL) & ~0xFFFFFULL; // round up to 1MB
             b += 0x100000ULL;                                  // 1MB gap after image
-            s_scratch_base = (uint32_t)b;
+            s_scratch_base = b;                                // 64-bit: no truncation
             s_cmdline_page = s_scratch_base + 0x00000;         // 4KB page
             s_tramp_addr   = s_scratch_base + 0x01000;         // 4KB page
             s_gai_base     = s_scratch_base + 0x100000;        // 1MB region
