@@ -1859,10 +1859,21 @@ static bool wg_try_native_manifest_fetch(const char *hostpath) {
     return ok;
 }
 
-static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
+static uint64_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (size == 0) size = 1;
     if ((size & 0x80000000u) || size > 512u * 1024 * 1024) return 0;
     uint32_t alloc = (size + 0xFFF) & ~0xFFFu;
+    if (wg_cpu_is_box64()) {
+        // box64: simple high-address bump allocator. Apple Silicon reserves the low
+        // 4GB and box64 reserves ~0x2_0000_0000..0x4_0000_0000, so use the huge free
+        // region at 0x80_0000_0000 (512GB). No 32-bit region/hole/free-list logic.
+        static uint64_t s_hi_heap = 0x8000000000ULL;
+        uint64_t a = (s_hi_heap + 0xFFFu) & ~0xFFFULL;
+        s_hi_heap = a + alloc;
+        uint8_t *z = calloc(1, alloc);
+        if (z) { wg_blink_write_mem(engine->blink, a, z, alloc); free(z); }
+        return a;
+    }
     // Reuse a reclaimed (VirtualFree'd) block first — keeps the bump pointer from
     // marching into OOM under the game's alloc/free churn. The block is already mapped;
     // re-zero it so it honors VirtualAlloc's zero-fill contract.
@@ -1918,7 +1929,12 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
 // (64KB on Windows): UE4's FMallocBinned2 masks pointers by that granularity to
 // find pool headers, so a merely page-aligned base makes it read canaries from
 // the wrong offset and (falsely) detect heap corruption.
-static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t align) {
+static uint64_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t align) {
+    if (wg_cpu_is_box64()) {
+        if (align < 0x1000u) align = 0x1000u;
+        uint64_t a = wg_guest_alloc(engine, size + align);   // over-alloc, then align up
+        return a ? ((a + (align - 1)) & ~((uint64_t)align - 1)) : 0;
+    }
     if (align > 0x1000u) {
         uint32_t aligned = (s_heap_ptr + (align - 1)) & ~(align - 1);
         if (aligned >= s_heap_ptr) s_heap_ptr = aligned;   // skip forward to alignment
@@ -2814,8 +2830,8 @@ static void wg_read_wstr(WGEngine *e, uint32_t addr, uint16_t *buf, int cap) {
 
 // A small persistent guest scratch int (for _errno / __p__commode / __p__fmode
 // style functions that must return a writable pointer). Allocated once.
-static uint32_t s_crt_errno = 0, s_crt_commode = 0, s_crt_fmode = 0;
-static uint32_t wg_crt_global(WGEngine *e, uint32_t *slot) {
+static uint64_t s_crt_errno = 0, s_crt_commode = 0, s_crt_fmode = 0;
+static uint64_t wg_crt_global(WGEngine *e, uint64_t *slot) {
     if (!*slot) *slot = wg_guest_alloc(e, 4);
     return *slot;
 }
@@ -3177,6 +3193,35 @@ static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_
     if (!strcmp(fn,"_callnewh"))       { *ret=0; return true; }
     if (!strcmp(fn,"_get_heap_handle")){ *ret=0x00D00000; return true; }
 
+    // __p___argc / __p___argv: the CRT reads *__p___argc() and *__p___argv() during
+    // startup, so they must return valid writable guest pointers (not the 0 an
+    // auto-stub gives). Provide a minimal argc=1, argv=["prog", NULL].
+    if (!strcmp(fn,"__p___argc")) {
+        static uint64_t slot = 0;
+        if (!slot) { slot = wg_guest_alloc(engine, 4); uint32_t one = 1;
+                     wg_blink_write_mem(engine->blink, slot, &one, 4); }
+        *ret = slot; return true;
+    }
+    if (!strcmp(fn,"__p___argv") || !strcmp(fn,"__p___wargv")) {
+        static uint64_t slot = 0;
+        if (!slot) {
+            uint64_t s = wg_guest_alloc(engine, 8);  wg_blink_write_mem(engine->blink, s, "prog", 5);
+            uint64_t arr = wg_guest_alloc(engine, 16); uint64_t z = 0;
+            wg_blink_write_mem(engine->blink, arr, &s, 8);
+            wg_blink_write_mem(engine->blink, arr + 8, &z, 8);
+            slot = wg_guest_alloc(engine, 8); wg_blink_write_mem(engine->blink, slot, &arr, 8);
+        }
+        *ret = slot; return true;
+    }
+    // __p__environ / __p__wenviron: pointer to the (empty) environ array -> a guest
+    // pointer holding NULL. The CRT reads *__p__environ() and walks it.
+    if (!strcmp(fn,"__p__environ") || !strcmp(fn,"__p__wenviron")) {
+        static uint64_t slot = 0;
+        if (!slot) { slot = wg_guest_alloc(engine, 8); uint64_t z = 0;
+                     wg_blink_write_mem(engine->blink, slot, &z, 8); }
+        *ret = slot; return true;
+    }
+
     // ---- CRT startup / onexit (return "success"; we don't run atexit at teardown) ----
     if (!strcmp(fn,"_configure_narrow_argv")) { *ret=0; return true; }
     if (!strcmp(fn,"_configure_wide_argv"))   { *ret=0; return true; }
@@ -3477,7 +3522,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             WG_LOGW(TAG, "  callers: %s", chain);
         }
         wg_blink_write_mem(engine->blink, rip, &s_trace[i].orig, 1);
-        wg_blink_set_rip(engine->blink, (uint32_t)rip);
+        wg_blink_set_rip(engine->blink, (uint64_t)rip);
         wg_blink_step(engine->blink);
         if (s_trace[i].armed) { uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, rip, &hlt, 1); }
         return true;
@@ -3510,7 +3555,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
         uint64_t crsp = wg_blink_get_reg(engine->blink, 4);
         uint64_t crbx = wg_blink_get_reg(engine->blink, 3);
         wg_blink_write_mem(engine->blink, (uint32_t)(crsp + 8), &crbx, 8);
-        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 5));
+        wg_blink_set_rip(engine->blink, (uint64_t)(rip + 5));
         (void)s_ctor_orig;
         return true;
     }
@@ -3574,7 +3619,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                             (unsigned long long)f10, (unsigned long long)f00);
             }
             wg_blink_set_reg(engine->blink, rg, nxt);            // reg = next (or 0 to break)
-            wg_blink_set_rip(engine->blink, (uint32_t)(rip + 4)); // past the 4-byte mov
+            wg_blink_set_rip(engine->blink, (uint64_t)(rip + 4)); // past the 4-byte mov
             (void)s_loop_orig;
             return true;
         }
@@ -3611,7 +3656,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // Section lookup: return our fake section so the value path is taken.
     if (s_anim_armed && rip == s_anim_addr2) {
         wg_blink_set_reg(engine->blink, 0, s_anim_section);     // rax = section
-        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 5));
+        wg_blink_set_rip(engine->blink, (uint64_t)(rip + 5));
         (void)s_anim_orig2;
         return true;
     }
@@ -3621,7 +3666,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
         int32_t idx = 0;
         if (rdx) wg_blink_write_mem(engine->blink, (uint32_t)rdx, &idx, 4);
         wg_blink_set_reg(engine->blink, 0, 0);
-        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 5));
+        wg_blink_set_rip(engine->blink, (uint64_t)(rip + 5));
         (void)s_anim_orig;
         return true;
     }
@@ -3737,7 +3782,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
         uint64_t cret = 0;
         wg_d3d11_dispatch(engine, rip, cargs, &cret);
         wg_blink_set_reg(engine->blink, 4, rsp + 8);     // pop return addr
-        wg_blink_set_rip(engine->blink, (uint32_t)ret_addr);
+        wg_blink_set_rip(engine->blink, (uint64_t)ret_addr);
         wg_blink_set_reg(engine->blink, 0, cret);         // RAX
         return true;
     }
@@ -9425,7 +9470,7 @@ static void *wg_worker_thread_entry(void *arg) {
                     if (ret >= img_lo && ret < img_hi && wg_recover_ok(ret)) {
                         wg_blink_set_reg(engine->blink, 0, 0);                  // RAX = 0
                         wg_blink_set_reg(engine->blink, 4, sp + (g64 ? 8 : 4)); // pop return addr
-                        wg_blink_set_rip(engine->blink, (uint32_t)ret);
+                        wg_blink_set_rip(engine->blink, (uint64_t)ret);
                         recovered = true;
                     }
                     wg_thunk_unlock();
@@ -11033,7 +11078,7 @@ void wg_engine_tick(WGEngine *engine) {
                             } }
                             wg_blink_set_reg(engine->blink, 0, 0);            // RAX = 0
                             wg_blink_set_reg(engine->blink, 4, sp + (g64 ? 8 : 4));
-                            wg_blink_set_rip(engine->blink, (uint32_t)ret);
+                            wg_blink_set_rip(engine->blink, (uint64_t)ret);
                             break;
                         }
                         if (s_recover_streak > WG_RECOVER_SPIN_LIMIT)
@@ -11089,7 +11134,7 @@ void wg_engine_tick(WGEngine *engine) {
                                         (unsigned long long)s_null_call_recover);
                             wg_blink_set_reg(engine->blink, 0, 0); // RAX = 0
                             wg_blink_set_reg(engine->blink, 4, sp + (g64 ? 8 : 4));
-                            wg_blink_set_rip(engine->blink, (uint32_t)ret);
+                            wg_blink_set_rip(engine->blink, (uint64_t)ret);
                             break;
                         }
                     }
